@@ -1,19 +1,29 @@
 import torch
 import torch.nn as nn
-# 从你现在的 registry 导入零件工厂工具
-from .registry import register_model, build_from_cfg, COMPONENT_REGISTRY
-from .utils import MVWarp, DeintShufflePack, ResidualBlock
+from typing import Dict, Optional
 
-@register_model
-class UnifiedMVSR(nn.Module):
-    def __init__(self, 
-                 mid=64, 
-                 blocks=15, 
-                 mv_mode='physical', 
-                 correct_offset=True,
-                 use_second_order=True,
-                 use_adaptive_fusion=True,
-                 refiner_cfg={'type': 'MVRefiner'}): # <-- 变成配置字典了！
+from ..registry import ARCH_REGISTRY, COMPONENT_REGISTRY, build_from_cfg
+from ...utils.ops import MVWarp, DeintShufflePack, ResidualBlock
+from ...utils.utils_flow import quarterPixelMV_to_pixelMV, rescale_mv_temporal
+
+
+@ARCH_REGISTRY.register()
+class mvd_net(nn.Module):
+    def __init__(
+        self, 
+        mid_channels: int, 
+        num_blocks: int,
+        # control second-order flow usage
+        use_second_order: bool,
+        # control MV preprocessing of 1-order MV
+        mv_correct_cfg: dict,
+        # control MV refiner
+        mv_refiner_cfg: Optional[Dict] = {'type': 'MVRefiner'},
+        # Control switch for enabling/disabling motion-static adaptive fusion
+        fusion_cfg: Optional[Dict] = {'type': 'AdaptiveFusion'}, 
+   
+    ):
+   
         super().__init__()
         
         # 保存开关
@@ -47,34 +57,9 @@ class UnifiedMVSR(nn.Module):
         # 去隔行上采样层
         self.deint_up = DeintShufflePack(mid, mid, scale_factor=2)
         self.last_conv = nn.Conv2d(mid, 3, 3, 1, 1)
-    def pre_process_mv(self, raw_mv, src_oe, tgt_oe, scale=0.5):
-        """
-        raw_mv: H.264 原始向量 [B, 2, H, W]
-        src_oe, tgt_oe: 参考场和目标场的极性 (0=Top, 1=Bot)
-        scale: 步长缩放 (一阶为 0.5, 二阶为 1.0)
-        """
-        # 1. H.264 亚像素单位转换：1/4 像素单位 -> 实际像素位移
-        mv = raw_mv / 4.0
-        
-        # 2. 时间步长缩放
-        mv = mv * scale
-        
-        # 3. 垂直偏移修正 (Correct Offset)
-        if self.mv_mode == 'physical' and self.correct_offset:
-            # 只有当两个场极性不同时 (一个 Top 一个 Bot)，才存在那 0.5 像素的物理错位
-            mask = (src_oe != tgt_oe).view(-1, 1, 1, 1).float()
-            
-            # 物理常识：Bottom 场在空间上比 Top 场靠下 0.5 像素
-            # 如果我们要对齐到 Bottom 场 (1)，位移需要 +0.5
-            # 如果我们要对齐到 Top 场 (0)，位移需要 -0.5
-            offset = torch.where(tgt_oe.view(-1, 1, 1, 1) == 1, 0.5, -0.5)
-            
-            # 只修正 Y 轴 (index 1)
-            mv[:, 1:2, :, :] += (mask * offset)
-            
-        return mv
+    
 
-    def compute_flow_logic(self, raw_mv, curr_feat, ref_feat, src_oe, tgt_oe):
+    def compute_flow(self, raw_mv, curr_feat, ref_feat, src_oe, tgt_oe):
         # 1. 物理修正 (归一化/缩放/0.5像素偏移)
         mv_init = self.pre_process_mv(raw_mv, src_oe, tgt_oe)
         
@@ -115,7 +100,7 @@ class UnifiedMVSR(nn.Module):
                     h2_prop = self.compute_flow(-mv_fwd[:, t+2], feats[:, t], feats[:, t+2], h_bwd_old, field_ids[:, t+2], field_ids[:, t], scale=1.0)
                     h_prop = (h1_prop + h2_prop) * 0.5  
                 else:
-                    h_prop = h1_warped
+                    h_prop = h1_prop
             h_bwd_old, h_bwd = h_bwd.clone(), self.backward_resblocks(h_prop + feats[:, t])
             bwd_features[t] = h_bwd
 
@@ -131,7 +116,7 @@ class UnifiedMVSR(nn.Module):
                     h2_prop = self.compute_flow(mv_fwd[:, t], feats[:, t], feats[:, t-2], h_fwd_old, field_ids[:, t-2], field_ids[:, t], scale=1.0)
                     h_prop = (h1_prop + h2_prop) * 0.5
                 else:
-                    h_prop = h1_warped
+                    h_prop = h1_prop
             h_fwd_old, h_fwd = h_fwd.clone(), self.forward_resblocks(h_prop + feats[:, t])
             
             fused = self.fusion(torch.cat([h_fwd, bwd_features[t]], dim=1))
