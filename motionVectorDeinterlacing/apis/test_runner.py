@@ -2,6 +2,7 @@
 import torch
 import math
 from tqdm import tqdm
+from skimage.metrics import structural_similarity
 from motionVectorDeinterlacing.models.registry import ARCH_REGISTRY
 from motionVectorDeinterlacing.datasets.builder import build_dataloader
 
@@ -11,6 +12,16 @@ def calculate_psnr(img1, img2):
     if mse == 0:
         return 100
     return 20 * math.log10(1.0 / math.sqrt(mse))
+
+def calculate_ssim(img1, img2):
+    """
+    输入 img1, img2 为 [3, H, W] 的 Tensor，范围 [0, 1]
+    """
+    # 转换为 HWC 格式的 numpy 数组
+    im1_np = img1.cpu().numpy().transpose(1, 2, 0)
+    im2_np = img2.cpu().numpy().transpose(1, 2, 0)
+    # channel_axis=2 表示第3个维度是颜色通道，data_range=1.0 表示数据范围是 0~1
+    return structural_similarity(im1_np, im2_np, data_range=1.0, channel_axis=2)
 
 def test_runner(cfg):
     print("📡 初始化 RealTimeMVDnet 评估流水线...")
@@ -30,6 +41,7 @@ def test_runner(cfg):
     
     total_psnr = 0.0
     total_frames = 0
+    total_ssim = 0.0
     
     with torch.no_grad():
         # 这里假设 dataloader 返回的字典中，包含了一个标识视频切换的标志 'is_new_video'
@@ -53,11 +65,14 @@ def test_runner(cfg):
             B, T = sr_outs.shape[:2]
             for t in range(T):
                 psnr = calculate_psnr(sr_outs[0, t], hr_targets[0, t])
+                ssim_val = calculate_ssim(sr_outs[0, t], hr_targets[0, t])
                 total_psnr += psnr
+                total_ssim += ssim_val
                 total_frames += 1
 
     avg_psnr = total_psnr / total_frames if total_frames > 0 else 0
-    print(f"✅ 测试完成！共评估 {total_frames} 帧，平均 PSNR: {avg_psnr:.2f} dB")
+    avg_ssim = total_ssim / total_frames if total_frames > 0 else 0 # ✅ 计算平均 SSIM
+    print(f"✅ 测试完成！共评估 {total_frames} 帧 | 平均 PSNR: {avg_psnr:.2f} dB | 平均 SSIM: {avg_ssim:.4f}")
 
 # 可以在文件最下面写个小入口，方便独立运行
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ dataset:
     type: 'RedsDeintDataset'
     root_dir: 'data/REDS'
     split: 'train'
-    seq_len: 5
+    seq_len: 15
     crop_lr: 64
     augment: true
     use_lmdb: true
@@ -13,7 +13,7 @@ dataset:
     type: 'RedsDeintDataset'
     root_dir: 'data/REDS'
     split: 'val'
-    seq_len: 5
+    seq_len: 30
     crop_lr: null
     augment: false
     use_lmdb: true
