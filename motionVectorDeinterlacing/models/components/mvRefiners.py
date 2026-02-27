@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from motionVectorDeinterlacing.models.registry import COMPONENT_REGISTRY
-from .blocks import ResidualBlock, build_activation
+from .blocks import StandardResidualBlock, build_activation
 from motionVectorDeinterlacing.utils.ops import mv_warp # 1. 修正导入
 
 # --- 0. 极简零初始化版 (Vanilla) ---
@@ -118,7 +118,7 @@ class ImageGuidedMVRefiner(nn.Module):
      
         self.fusion = nn.Conv2d(2 + mid * 2, mid, 3, 1, 1)
         self.body = nn.Sequential(
-            *[ResidualBlock(mid, act_cfg=act_cfg) for _ in range(4)]
+            *[StandardResidualBlock(mid, act_cfg=act_cfg) for _ in range(4)]
         )
         self.mask_predictor = nn.Sequential(
             nn.Conv2d(mid * 2, mid, 3, 1, 1),
@@ -154,8 +154,8 @@ class LiteImageGuidedMVRefiner(nn.Module):
         
         self.fusion = nn.Conv2d(2 + mid * 2, mid, 3, 1, 1)
         self.body = nn.Sequential(
-            ResidualBlock(mid, act_cfg=act_cfg),
-            ResidualBlock(mid, act_cfg=act_cfg)
+            StandardResidualBlock(mid, act_cfg=act_cfg),
+            StandardResidualBlock(mid, act_cfg=act_cfg)
         )
         # 接口统一：只输出 2 通道
         self.out_conv = nn.Conv2d(mid, 2, 3, 1, 1)
@@ -199,8 +199,8 @@ class LiteConvexMVRefiner(nn.Module):
         # 2. 轻量级特征与误差融合 (1/4 分辨率下运行)
         self.fusion = nn.Conv2d(2 + mid * 2, mid, 3, 1, 1)
         self.body = nn.Sequential(
-            ResidualBlock(mid, act_cfg=act_cfg),
-            ResidualBlock(mid, act_cfg=act_cfg)
+            StandardResidualBlock(mid, act_cfg=act_cfg),
+            StandardResidualBlock(mid, act_cfg=act_cfg)
         )
         
         # 3. 计算低分辨率的 MV 修正量

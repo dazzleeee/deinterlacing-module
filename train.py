@@ -48,6 +48,15 @@ def parse_args():
     parser.add_argument('--local_rank', type=int, default=-1, help='For DDP')
     return parser.parse_args()
 
+class AttrDict(dict):
+    """Allows nested dictionary access via dot notation."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.__dict__ = self
+        for key, value in self.items():
+            if isinstance(value, dict):
+                self[key] = AttrDict(value)
+
 def main():
     args = parse_args()
     
@@ -69,8 +78,12 @@ def main():
     logger = get_root_logger('MVDNet', log_file=os.path.join(exp_dir, 'train.log'))
     logger.info(f"Experiment Dir: {exp_dir}")
 
-    # Pydantic 类型校验与参数补全
-    cfg = MVDNetConfig(**cfg_dict) 
+# --- FIX STARTS HERE ---
+    # Wrap the root config to support dot-notation (cfg.train.lr)
+    cfg = AttrDict(cfg_dict)
+    # Parse specifically the model section into MVDNetConfig
+    cfg.model = MVDNetConfig(**cfg_dict.get('model', {})) 
+    # --- FIX ENDS HERE ---
     
     # 3. 启动 Runner
     runner = TrainRunner(cfg, exp_dir) 

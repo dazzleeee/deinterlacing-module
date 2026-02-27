@@ -16,6 +16,7 @@ model:
     type: 'ResidualFeatureExtractor'
     in_channels: 4
     num_blocks: 5
+    nf: 64
   mv_refiner_cfg: 
     type: 'LiteConvexMVRefiner' # ！！最强光流凸上采样精调！！
   gmc_cfg: 

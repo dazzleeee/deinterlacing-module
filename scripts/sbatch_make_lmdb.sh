@@ -15,7 +15,7 @@ module load python/3.11
 module load opencv/4.9.0
 
 # 激活你全新的虚拟环境
-source /home/sihanuo/projects/def-jyzhao/SihanZhang/deinterlacing/venv_mvd/bin/activate
+source /home/sihanuo/projects/def-jyzhao/SihanZhang/deinterlacing/.venv/bin/activate
 
 echo "Job started on $(hostname) at $(date)"
 

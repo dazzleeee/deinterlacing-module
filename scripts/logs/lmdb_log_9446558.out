@@ -1,0 +1,31 @@
+The following modules were not unloaded:
+  (Use "module --force purge" to unload all):
+
+  1) CCconfig        6)  ucx/1.14.1         11) flexiblas/3.3.1
+  2) gentoo/2023     7)  libfabric/1.18.0   12) imkl/2023.2.0
+  3) gcccore/.12.3   8)  pmix/4.2.4         13) StdEnv/2023
+  4) gcc/12.3        9)  ucc/1.2.0
+  5) hwloc/2.9.1     10) openmpi/4.1.5
+/var/spool/slurmd/job9446558/slurm_script: line 18: /home/sihanuo/projects/def-jyzhao/SihanZhang/deinterlacing/venv_mvd/bin/activate: No such file or directory
+Job started on c473.nibi.sharcnet at Fri Feb 27 03:29:33 PM EST 2026
+Making LMDB for REDS_processed...
+Traceback (most recent call last):
+  File "/project/6083632/SihanZhang/deinterlacingGit/deinterlacing-module/scripts/create_lmdb.py", line 5, in <module>
+    import lmdb
+ModuleNotFoundError: No module named 'lmdb'
+Making LMDB for REDS_data_GT...
+Traceback (most recent call last):
+  File "/project/6083632/SihanZhang/deinterlacingGit/deinterlacing-module/scripts/create_lmdb.py", line 5, in <module>
+    import lmdb
+ModuleNotFoundError: No module named 'lmdb'
+Making LMDB for REDS_processed_val...
+Traceback (most recent call last):
+  File "/project/6083632/SihanZhang/deinterlacingGit/deinterlacing-module/scripts/create_lmdb.py", line 5, in <module>
+    import lmdb
+ModuleNotFoundError: No module named 'lmdb'
+Making LMDB for REDS_data_GT_val...
+Traceback (most recent call last):
+  File "/project/6083632/SihanZhang/deinterlacingGit/deinterlacing-module/scripts/create_lmdb.py", line 5, in <module>
+    import lmdb
+ModuleNotFoundError: No module named 'lmdb'
+All LMDB packages created successfully at Fri Feb 27 03:29:33 PM EST 2026

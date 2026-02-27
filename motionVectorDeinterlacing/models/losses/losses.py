@@ -1,9 +1,9 @@
 # models/losses.py
-from motionVectorDeinterlacing.models.registry import COMPONENT_REGISTRY
+from motionVectorDeinterlacing.models.registry import COMPONENT_REGISTRY, LOSS_REGISTRY
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .registry import LOSS_REGISTRY
+
 from motionVectorDeinterlacing.utils.ops import mv_warp # 1. 修正导入
 
 # ==========================================
@@ -59,38 +59,8 @@ class FieldAwareMaskedTemporalLoss(nn.Module):
         return loss_temporal / (T - 1)
 
 
-@LOSS_REGISTRY.register('MVDNetLossAggregator')
-class MVDNetLossAggregator(nn.Module):
-    # __init__ 保持你原来的不变...
-    # ...
-    def forward(self, outputs, targets, epoch):
-        loss_dict = {}
-        total_loss = 0.0
-        
-        l_char = self.char_loss(outputs['sr'], targets['hr'])
-        loss_dict['l_char'] = l_char * self.w_char
-        total_loss += loss_dict['l_char']
 
-        flows = outputs['flows']
-        lr_imgs = outputs['lr_imgs']
 
-        if epoch >= self.start_flow:
-            l_photo, l_smooth = self.flow_loss(flows, lr_imgs)
-            loss_dict['l_flow'] = (l_photo + l_smooth) * self.w_flow
-            total_loss += loss_dict['l_flow']
-
-        if epoch >= self.start_temp and self.w_temp > 0.0:
-            l_temp = self.temp_loss(outputs['sr'], flows, outputs.get('masks'))
-            loss_dict['l_temp'] = l_temp * self.w_temp
-            total_loss += loss_dict['l_temp']
-            
-        if epoch >= self.start_pp:
-            l_pp = self.pp_loss(outputs['sr'], flows)
-            loss_dict['l_pp'] = l_pp * self.w_pp
-            total_loss += loss_dict['l_pp']
-
-        loss_dict['total_loss'] = total_loss
-        return loss_dict
 
 # ==========================================
 # 3. 光流约束 Loss (FlowLoss)
@@ -191,7 +161,7 @@ class MVDNetLossAggregator(nn.Module):
         # 2. 读取权重参数
         self.w_char = char_cfg.get('weight', 1.0)
         self.w_flow = flow_cfg.get('weight', 0.05)
-        self.w_temp = temp_cfg.get('weight', 0.1) # 若想先跑通基线，在 config.yml 设为 0.0 即可
+        self.w_temp = temp_cfg.get('weight', 0.1) 
         self.w_pp = pp_cfg.get('weight', 0.5)
 
         # 3. 读取开启轮次
@@ -204,11 +174,10 @@ class MVDNetLossAggregator(nn.Module):
         # 4. 实例化裁判员
         self.char_loss = CharbonnierLoss()
         self.flow_loss = FlowLoss()
-        self.temp_loss = FieldAwareMaskedTemporalLoss() # <--- 升级版
+        self.temp_loss = FieldAwareMaskedTemporalLoss() 
         self.pp_loss = StaticBackgroundLoss(motion_sensitivity=motion_sens)
 
-    
-def forward(self, outputs, targets, epoch):
+    def forward(self, outputs, targets, epoch):
         loss_dict = {}
         total_loss = 0.0
         

@@ -20,12 +20,16 @@ def main():
     args = parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 1. 初始化模型并加载权重
     with open(args.config, 'r') as f:
-        cfg = MVDNetConfig(**yaml.safe_load(f))
+        cfg_dict = yaml.safe_load(f)
     
-    # [步骤 A]: 构建空模型结构
-    model = ARCH_REGISTRY.get('RealTimeMVDnet')(cfg.model).to(device)
+    # Parse only the model configuration
+    model_cfg = MVDNetConfig(**cfg_dict.get('model', {}))
+    
+    # [ A]: Initialize the model properly
+    model = ARCH_REGISTRY.get('RealTimeMVDnet')(model_cfg).to(device)
+
+    
     
     # [步骤 B]: 加载权重 (优先加载平滑过的 EMA 权重)
     checkpoint = torch.load(args.weight, map_location=device)

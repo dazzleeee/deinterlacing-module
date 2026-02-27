@@ -1,0 +1,6 @@
+Metadata-Version: 2.1
+Name: motionVectorDeinterlacing
+Version: 1.0.0
+Summary: Real-Time Motion Vector Deinterlacing and Super-Resolution
+Author: Vince
+Requires-Python: >=3.8

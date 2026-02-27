@@ -16,7 +16,7 @@ module load StdEnv/2023
 module load python/3.11
 module load opencv/4.9.0
 
-source /home/sihanuo/projects/def-jyzhao/SihanZhang/deinterlacing/venv_mvd/bin/activate
+source /home/sihanuo/projects/def-jyzhao/SihanZhang/deinterlacing/.venv/bin/activate
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=12
@@ -27,17 +27,20 @@ echo "Job started on $(hostname) at $(date)"
 # =================================================================
 # 🚀 终极 I/O 优化：将数据拷贝到计算节点本地固态硬盘 ($SLURM_TMPDIR)
 # =================================================================
-echo "Copying LMDB datasets to \$SLURM_TMPDIR..."
-time cp -r /home/sihanuo/projects/def-jyzhao/SihanZhang/deinterlacing/data/REDS $SLURM_TMPDIR/REDS
+# 1. 在本地极速固态硬盘创建目录
+mkdir -p $SLURM_TMPDIR/REDS_data
+
+echo "Copying LMDB datasets from scratch to \$SLURM_TMPDIR..."
+# 2. 从 scratch 拷贝数据 (确保包含所有 .lmdb 文件夹)
+time cp -r /home/sihanuo/scratch/SihanZhangData/*.lmdb $SLURM_TMPDIR/REDS_data/
 echo "Copy finished!"
 
-# 建立软链接魔法：把你项目里的 data/REDS 临时指向固态硬盘
-# 这样你代码里的 YAML 依然可以写 root_dir: 'data/REDS'，但实际上读的是本地固态！
-rm -rf data/REDS_link  # 清理可能存在的旧链接
-ln -s $SLURM_TMPDIR/REDS data/REDS_link
+# 3. 建立软链接魔法：确保指向刚才创建的 REDS_data 目录 [cite: 24]
+rm -rf data/REDS_link  
+ln -s $SLURM_TMPDIR/REDS_data data/REDS_link
 
-# ⚠️ 注意：你需要在你的 YAML 配置文件里，把 root_dir 改为 'data/REDS_link'
-# =================================================================
+# ⚠️ 此时，YAML 配置文件里的 root_dir: 'data/REDS_link' 就能通过这个“传送门”
+# 访问到本地固态硬盘里的 REDS_processed.lmdb 等文件了。
 
 # 启动训练
 torchrun --nproc_per_node=2 \

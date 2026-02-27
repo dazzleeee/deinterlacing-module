@@ -20,7 +20,7 @@ class RedsDeintDataset(Dataset):
     """
     def __init__(self, root_dir, split='train',
                  seq_len=5, crop_lr=None, augment=False,
-                 img_tmpl="{:08d}.png", use_lmdb=True):  # ✅ 新增 use_lmdb 开关
+                 img_tmpl="{:08d}.png", use_lmdb=True, **kwargs):  # ✅ 新增 use_lmdb 开关
         
         self.split = split
         self.seq_len = seq_len 
@@ -36,10 +36,12 @@ class RedsDeintDataset(Dataset):
         # 1. 目录路由
         if split == 'train':
             self.gt_root = os.path.join(root_dir, 'REDS_data_GT.lmdb' if use_lmdb else 'REDS_data_GT')
-            self.codec_root = os.path.join(root_dir, 'outputs_interlaced.lmdb' if use_lmdb else 'outputs_interlaced')
+            # 💡 关键修改：改为你在 scratch 下打包出的真实文件夹名
+            self.codec_root = os.path.join(root_dir, 'REDS_processed.lmdb' if use_lmdb else 'REDS_processed')
         else:
             self.gt_root = os.path.join(root_dir, 'REDS_data_GT_val.lmdb' if use_lmdb else 'REDS_data_GT_val')
-            self.codec_root = os.path.join(root_dir, 'outputs_val.lmdb' if use_lmdb else 'outputs_val') 
+            # 💡 关键修改：改为验证集真实文件夹名
+            self.codec_root = os.path.join(root_dir, 'REDS_processed_val.lmdb' if use_lmdb else 'REDS_processed_val')
             
         if not os.path.exists(self.gt_root) or not os.path.exists(self.codec_root):
             raise RuntimeError(f"数据路径不存在: {self.gt_root} 或 {self.codec_root}")

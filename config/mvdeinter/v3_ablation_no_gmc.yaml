@@ -16,6 +16,7 @@ model:
     type: 'ResidualFeatureExtractor'
     in_channels: 4
     num_blocks: 5
+    nf: 64
   mv_refiner_cfg: 
     type: 'LiteConvexMVRefiner'
   gmc_cfg: 

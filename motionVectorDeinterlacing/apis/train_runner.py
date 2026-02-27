@@ -22,9 +22,10 @@ class TrainRunner:
         self.device = torch.device(f'cuda:{self.rank}')
         
         # 1. 数据加载
-        self.train_loader = build_dataloader(cfg.dataset.train, self.world_size, self.rank)
+        self.train_loader = build_dataloader(cfg.dataset['train'], self.world_size, self.rank)
         
         # 2. 模型与 DDP
+        
         self.model = ARCH_REGISTRY.get('RealTimeMVDnet')(cfg.model).to(self.device)
         if self.world_size > 1:
             self.model = DDP(self.model, device_ids=[self.rank], output_device=self.rank, find_unused_parameters=True)
