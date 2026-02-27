@@ -3,7 +3,7 @@ import torch
 import math
 from tqdm import tqdm
 from motionVectorDeinterlacing.models.registry import ARCH_REGISTRY
-from datasets.builder import build_dataloader # 假设你有数据加载器
+from motionVectorDeinterlacing.datasets.builder import build_dataloader
 
 def calculate_psnr(img1, img2):
     """简单的 PSNR 计算，假设输入范围是 [0, 1]"""
