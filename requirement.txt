@@ -1,0 +1,14 @@
+# PyTorch 环境 (在 Compute Canada 通常不需要 pip 安装 torch，但留作记录)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# 核心依赖
+numpy>=1.21.0
+opencv-python>=4.5.0
+PyYAML>=6.0
+pydantic>=2.0.0
+
+# 辅助工具
+tqdm>=4.65.0
+tensorboard>=2.13.0
+thop>=0.1.1.post2209072238  # 用于计算 FLOPs

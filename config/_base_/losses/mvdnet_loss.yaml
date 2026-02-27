@@ -1,0 +1,13 @@
+loss:
+  charbonnier:
+    weight: 1.0
+  flow:
+    weight: 0.05
+    start_epoch: 50
+  temporal:
+    weight: 0.1
+    start_epoch: 150
+  pingpong:
+    weight: 0.5
+    start_epoch: 300
+    motion_sensitivity: 0.5

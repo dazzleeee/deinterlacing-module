@@ -1,31 +1,27 @@
+import logging
 import os
-import time
+from .distributionUtil import is_master
 
-def get_root_logger(args):
-    # 1. 基础实验目录，例如 work_dirs/unified_mvsr_v1_base
-    exp_dir = os.path.join('work_dirs', args.exp_name)
-    
-    # 2. 生成时间戳，例如 20260212_103000
-    timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
-    
-    # 3. 拼接最终目录
-    log_dir = os.path.join(exp_dir, timestamp)
-    
-    # 4. 自动创建文件夹 (如果有父级目录不存在，会自动创建)
-    os.makedirs(log_dir, exist_ok=True)
-    
-    # 5. 创建 'latest' 软链接 (可选，方便快速找到最新实验)
-    # 先删除旧的 link
-    symlink_path = os.path.join(exp_dir, 'latest')
-    if os.path.islink(symlink_path):
-        os.remove(symlink_path)
-    # 指向最新的 timestamp 文件夹
-    os.symlink(timestamp, symlink_path)
-    
-    print(f"实验日志将保存在: {log_dir}")
-    return log_dir
+def get_root_logger(logger_name='MVDNet', log_file=None, log_level=logging.INFO):
+    logger = logging.getLogger(logger_name)
+    # 如果已经配置过，直接返回，防止重复打印
+    if logger.hasHandlers():
+        return logger
+        
+    logger.setLevel(log_level)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-# 在 train.py 里调用
-# args.exp_name 来自命令行参数
-log_dir = get_root_logger(args) 
-# 然后把 log_dir 传给 Checkpoint 保存函数
+    # 只有 Rank 0 的主进程才允许输出日志，防止多卡打印刷屏
+    if is_master():
+        # 1. 终端输出
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+        
+        # 2. 文件输出
+        if log_file is not None:
+            file_handler = logging.FileHandler(log_file, mode='w')
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+            
+    return logger

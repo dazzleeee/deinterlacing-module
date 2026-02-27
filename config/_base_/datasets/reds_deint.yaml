@@ -1,0 +1,21 @@
+dataset:
+  train:
+    type: 'RedsDeintDataset'
+    root_dir: 'data/REDS'
+    split: 'train'
+    seq_len: 5
+    crop_lr: 64
+    augment: true
+    use_lmdb: true
+    batch_size: 4
+    num_workers: 4
+  val:
+    type: 'RedsDeintDataset'
+    root_dir: 'data/REDS'
+    split: 'val'
+    seq_len: 5
+    crop_lr: null
+    augment: false
+    use_lmdb: true
+    batch_size: 1
+    num_workers: 2

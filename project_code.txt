@@ -1,0 +1,2723 @@
+
+==================================================
+FILE: ./setup.py
+==================================================
+from setuptools import setup, find_packages
+
+setup(
+    name="motionVectorDeinterlacing",
+    version="1.0.0",
+    description="Real-Time Motion Vector Deinterlacing and Super-Resolution",
+    author="Vince",
+    packages=find_packages(), # 会自动找到 motionVectorDeinterlacing 文件夹
+    python_requires=">=3.8",
+)
+==================================================
+FILE: ./train.py
+==================================================
+import argparse
+import yaml
+import torch
+import os
+import shutil
+import time
+import collections.abc
+from motionVectorDeinterlacing.utils.distributionUtil import init_dist, is_master
+from motionVectorDeinterlacing.utils.logger import get_root_logger
+from motionVectorDeinterlacing.apis.train_runner import TrainRunner
+from config.config_schema import MVDNetConfig
+
+def update_dict(d, u):
+    """递归深度合并字典"""
+    for k, v in u.items():
+        if isinstance(v, collections.abc.Mapping):
+            d[k] = update_dict(d.get(k, {}), v)
+        else:
+            d[k] = v
+    return d
+
+def load_config(file_path):
+    """支持 _base_ 继承的 YAML 解析器"""
+    with open(file_path, 'r', encoding='utf-8') as f:
+        cfg = yaml.safe_load(f)
+    
+    # 检查是否存在基类配置文件
+    if '_base_' in cfg:
+        base_files = cfg.pop('_base_')
+        if isinstance(base_files, str):
+            base_files = [base_files]
+            
+        base_cfg = {}
+        for base_file in base_files:
+            # 解析相对路径：以当前 yaml 文件所在目录为基准
+            base_file_path = os.path.normpath(os.path.join(os.path.dirname(file_path), base_file))
+            # 递归加载并合并基础配置
+            base_cfg = update_dict(base_cfg, load_config(base_file_path))
+        
+        # 用当前文件中的专属配置去覆盖基础配置
+        cfg = update_dict(base_cfg, cfg)
+        
+    return cfg
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train RealTimeMVDnet')
+    parser.add_argument('-c', '--config', type=str, required=True, help='Path to config yaml')
+    parser.add_argument('--local_rank', type=int, default=-1, help='For DDP')
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    
+    # 1. 唤醒 DDP
+    init_dist(args.local_rank)
+    
+    # --- 实验目录与配置备份初始化 (只在主进程执行) ---
+    exp_name = os.path.splitext(os.path.basename(args.config))[0]
+    timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
+    exp_dir = os.path.join('work_dirs', f"{exp_name}_{timestamp}")
+    
+    if is_master():
+        os.makedirs(exp_dir, exist_ok=True)
+        shutil.copy(args.config, os.path.join(exp_dir, 'config.yaml'))
+    
+    # 2. 解析支持继承的配置！
+    cfg_dict = load_config(args.config)
+    
+    logger = get_root_logger('MVDNet', log_file=os.path.join(exp_dir, 'train.log'))
+    logger.info(f"Experiment Dir: {exp_dir}")
+
+    # Pydantic 类型校验与参数补全
+    cfg = MVDNetConfig(**cfg_dict) 
+    
+    # 3. 启动 Runner
+    runner = TrainRunner(cfg, exp_dir) 
+    runner.train()
+
+if __name__ == '__main__':
+    main()
+==================================================
+FILE: ./inference.py
+==================================================
+import argparse
+import cv2
+import torch
+import numpy as np
+from pathlib import Path
+from motionVectorDeinterlacing.models.registry import ARCH_REGISTRY
+from config.config_schema import MVDNetConfig
+import yaml
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Real-Time Streaming Inference for MVDNet')
+    parser.add_argument('-c', '--config', type=str, required=True, help='Path to config yaml')
+    parser.add_argument('-w', '--weight', type=str, required=True, help='Path to best_model.pth')
+    parser.add_argument('-i', '--input_video', type=str, required=True, help='Input interlace video')
+    parser.add_argument('-o', '--output_video', type=str, default='output.mp4', help='Output HR video')
+    parser.add_argument('--chunk_size', type=int, default=5, help='Sequence length for each forward pass')
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 1. 初始化模型并加载权重
+    with open(args.config, 'r') as f:
+        cfg = MVDNetConfig(**yaml.safe_load(f))
+    
+    # [步骤 A]: 构建空模型结构
+    model = ARCH_REGISTRY.get('RealTimeMVDnet')(cfg.model).to(device)
+    
+    # [步骤 B]: 加载权重 (优先加载平滑过的 EMA 权重)
+    checkpoint = torch.load(args.weight, map_location=device)
+    model.load_state_dict(checkpoint.get('ema_state_dict', checkpoint['state_dict']))
+    
+    # [步骤 C]: ！！！极其重要：切换到推理模式 ！！！
+    model.eval()
+    
+    # [步骤 D]: 🚀 触发重参数化魔法，融合多分支卷积！(必须在 eval() 之后调用)
+    for module in model.modules():
+        if hasattr(module, 'switch_to_deploy'):
+            module.switch_to_deploy()
+            
+    # [步骤 E]: 唤醒状态机，清空历史缓存，准备迎接新视频流
+    model.reset_state()
+
+    # 2. 准备视频读写器
+    # ... 后面的代码完全保持不变 ...
+    # 2. 准备视频读写器
+    cap = cv2.VideoCapture(args.input_video)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) # 这里的 height 是物理场的高度
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out_writer = cv2.VideoWriter(args.output_video, fourcc, fps, (width, height * 2))
+
+    buffer_imgs = []
+    buffer_mvs = []
+    buffer_fields = []
+    
+    print(f"Starting inference... Chunk size: {args.chunk_size}")
+
+    # 3. 核心推流循环 (Streaming Loop)
+    # 在不计算梯度的情况下运行，彻底释放显存
+    with torch.no_grad():
+        # 在 75 行 `with torch.no_grad():` 的下一行加上这几句：
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        total_time_ms = 0.0
+        total_frames = 0
+        frame_idx = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            lr_field = frame_rgb 
+            mv_fwd = np.zeros((2, height, width), dtype=np.float32) 
+            field_id = frame_idx % 2 
+            
+            t_img = torch.from_numpy(lr_field).permute(2, 0, 1).float() / 255.0
+            t_mv = torch.from_numpy(mv_fwd).float()
+            
+            buffer_imgs.append(t_img)
+            buffer_mvs.append(t_mv)
+            buffer_fields.append(field_id)
+            
+            if len(buffer_imgs) == args.chunk_size:
+                b_imgs = torch.stack(buffer_imgs).unsqueeze(0).to(device)
+                b_mvs = torch.stack(buffer_mvs).unsqueeze(0).to(device)
+                b_fields = torch.tensor(buffer_fields).unsqueeze(0).to(device)
+                start_event.record()
+                
+                sr_outs = model(b_imgs, b_mvs, b_fields)
+                
+                end_event.record()
+                torch.cuda.synchronize() # 强制 CPU 等待 GPU 算完
+                
+                chunk_time = start_event.elapsed_time(end_event) # 毫秒
+                total_time_ms += chunk_time
+                total_frames += args.chunk_size
+                
+                # 打印当前 Chunk 每帧的平均耗时
+                print(f"Inference Time per frame: {chunk_time / args.chunk_size :.2f} ms | FPS: {1000.0 / (chunk_time / args.chunk_size):.1f}")
+               
+                
+                for t in range(args.chunk_size):
+                    out_frame = sr_outs[0, t].permute(1, 2, 0).cpu().numpy()
+                    out_frame = np.clip(out_frame * 255.0, 0, 255).astype(np.uint8)
+                    # ✅ 写回视频前转换回 BGR：RGB -> BGR
+                    out_frame_bgr = cv2.cvtColor(out_frame, cv2.COLOR_RGB2BGR)
+                    out_writer.write(out_frame_bgr)
+                
+                buffer_imgs.clear()
+                buffer_mvs.clear()
+                buffer_fields.clear()
+            
+            frame_idx += 1
+
+    # 处理视频结尾不够一个 Chunk 大小的剩余帧
+    if len(buffer_imgs) > 0:
+        b_imgs = torch.stack(buffer_imgs).unsqueeze(0).to(device)
+        b_mvs = torch.stack(buffer_mvs).unsqueeze(0).to(device)
+        b_fields = torch.tensor(buffer_fields).unsqueeze(0).to(device)
+        sr_outs = model(b_imgs, b_mvs, b_fields)
+        for t in range(len(buffer_imgs)):
+            out_frame = sr_outs[0, t].permute(1, 2, 0).cpu().numpy()
+            out_frame = np.clip(out_frame * 255.0, 0, 255).astype(np.uint8)
+            out_frame_bgr = cv2.cvtColor(out_frame, cv2.COLOR_RGB2BGR)
+            out_writer.write(out_frame_bgr) # ✅ 写入 BGR 格式
+     
+    cap.release()
+    out_writer.release()
+    print("Inference completed successfully!")
+
+if __name__ == '__main__':
+    main()
+==================================================
+FILE: ./tools/test_video.py
+==================================================
+
+==================================================
+FILE: ./config/config_schema.py
+==================================================
+from pydantic import BaseModel, ConfigDict
+from typing import Dict, Optional, Union, Any
+
+
+class MVDNetConfig(BaseModel):
+    model_config = ConfigDict(extra='allow')
+
+    # --- 基础参数 (必须和网络底层的变量名一模一样) ---
+    mid: int = 64                 
+    num_blocks: int = 15
+    lookahead: int = 2
+    propagation_order: int = 1    
+    scale: int = 2                
+    
+    # --- 激活函数 ---
+    feat_act_cfg: Union[str, Dict[str, Any]] = "LeakyReLU"
+    body_act_cfg: Union[str, Dict[str, Any]] = "PReLU"
+    
+    # ==========================================
+    # --- 子模块组件配置 (字典占位，供 registry 反射) ---
+    # ==========================================
+    feature_extractor_cfg: Dict[str, Any] = {'type': 'ResidualFeatureExtractor', 'in_channels': 4} 
+    mv_refiner_cfg: Dict[str, Any] = {'type': 'LiteConvexMVRefiner'}
+    gmc_cfg: Dict[str, Any] = {'type': 'GMC'}
+    
+    residual_block_cfg: Dict[str, Any] = {'type': 'StandardResidualBlock'}
+    
+    # 网络需要的三种融合模块
+    foward_backward_fusion_cfg: Dict[str, Any] = {'type': 'BasicConcatFusion'}
+    h_prop_current_feat_fusion_cfg: Dict[str, Any] = {'type': 'SoftGateAdaptiveFusion'}
+    first_2nd_order_fusion_cfg: Dict[str, Any] = {'type': 'DeinterlacingMultiOrderFusion'}
+    
+    deint_up_cfg: Dict[str, Any] = {'type': 'DeintShufflePack', 'scale_factor': 2}
+==================================================
+FILE: ./config/_base_/losses/mvdnet_loss.yaml
+==================================================
+loss:
+  charbonnier:
+    weight: 1.0
+  flow:
+    weight: 0.05
+    start_epoch: 50
+  temporal:
+    weight: 0.1
+    start_epoch: 150
+  pingpong:
+    weight: 0.5
+    start_epoch: 300
+    motion_sensitivity: 0.5
+==================================================
+FILE: ./config/_base_/datasets/reds_deint.yaml
+==================================================
+dataset:
+  train:
+    type: 'RedsDeintDataset'
+    root_dir: 'data/REDS'
+    split: 'train'
+    seq_len: 5
+    crop_lr: 64
+    augment: true
+    use_lmdb: true
+    batch_size: 4
+    num_workers: 4
+  val:
+    type: 'RedsDeintDataset'
+    root_dir: 'data/REDS'
+    split: 'val'
+    seq_len: 5
+    crop_lr: null
+    augment: false
+    use_lmdb: true
+    batch_size: 1
+    num_workers: 2
+==================================================
+FILE: ./config/_base_/schedules/schedule_adamw_cos.yaml
+==================================================
+train:
+  epochs: 600
+  lr: 0.0002
+  weight_decay: 0.0001
+  log_freq: 50
+==================================================
+FILE: ./config/mvdeinter/mvdeinter_v1_base.yaml
+==================================================
+_base_:
+  - '../_base_/datasets/reds_deint.yaml'
+  - '../_base_/schedules/schedule_adamw_cos.yaml'
+  - '../_base_/losses/mvdnet_loss.yaml'
+
+# 这里开始覆盖或新增当前实验的具体配置
+model:
+  mid: 64
+  num_blocks: 15
+  lookahead: 2
+  propagation_order: 1
+  scale: 2
+  
+  # 全局激活函数
+  feat_act_cfg: "LeakyReLU"
+  body_act_cfg: "PReLU"
+  
+  # 子模块组件配置
+  feature_extractor_cfg: 
+    type: 'ResidualFeatureExtractor'
+    in_channels: 4
+    num_blocks: 5
+    
+  mv_refiner_cfg: 
+    type: 'LiteConvexMVRefiner'
+    
+  gmc_cfg: 
+    type: 'GMC'
+    
+  residual_block_cfg: 
+    type: 'StandardResidualBlock'
+    
+  foward_backward_fusion_cfg: 
+    type: 'BasicConcatFusion'
+    
+  h_prop_current_feat_fusion_cfg: 
+    type: 'SoftGateAdaptiveFusion'
+    
+  first_2nd_order_fusion_cfg: 
+    type: 'DeinterlacingMultiOrderFusion'
+    
+  deint_up_cfg: 
+    type: 'DeintShufflePack'
+    scale_factor: 2
+==================================================
+FILE: ./motionVectorDeinterlacing/__init__.py
+==================================================
+from .models import *
+from .datasets import *
+from .utils import *
+==================================================
+FILE: ./motionVectorDeinterlacing/apis/train_runner.py
+==================================================
+# runners/train_runner.py
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.cuda.amp import GradScaler, autocast
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter # ✅ 引入 TensorBoard
+import logging
+import os
+
+from motionVectorDeinterlacing.models.registry import ARCH_REGISTRY, LOSS_REGISTRY
+
+from motionVectorDeinterlacing.datasets.builder import build_dataloader
+from motionVectorDeinterlacing.utils.distributionUtil import is_master, get_dist_info
+from motionVectorDeinterlacing.utils.ema import ModelEMA
+
+class TrainRunner:
+    def __init__(self, cfg, exp_dir):
+        self.cfg = cfg
+        self.exp_dir = exp_dir
+        self.rank, self.world_size = get_dist_info()
+        self.device = torch.device(f'cuda:{self.rank}')
+        
+        # 1. 数据加载
+        self.train_loader = build_dataloader(cfg.dataset.train, self.world_size, self.rank)
+        
+        # 2. 模型与 DDP
+        self.model = ARCH_REGISTRY.get('RealTimeMVDnet')(cfg.model).to(self.device)
+        if self.world_size > 1:
+            self.model = DDP(self.model, device_ids=[self.rank], output_device=self.rank, find_unused_parameters=True)
+            
+        # ✅ 3. 初始化 EMA 影子模型 (衰减率通常取 0.999 或 0.9999)
+        self.ema = ModelEMA(self.model, decay=0.999)
+        
+        # 4. 损失函数与优化器
+        self.loss_aggregator = LOSS_REGISTRY.get('MVDNetLossAggregator')(cfg.loss).to(self.device)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+        self.scaler = GradScaler() 
+        
+        # ✅ 5. LR Scheduler (余弦退火)
+        # T_max 设为总 Iteration 数 (总 Epoch * 每个 Epoch 的 Batch 数)
+        total_iters = cfg.train.epochs * len(self.train_loader)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=total_iters, eta_min=1e-6
+        )
+        
+        # 6. 杂项与 TensorBoard
+        self.start_epoch = 0
+        self.total_epochs = cfg.train.epochs
+        self.global_step = 0
+        self.logger = logging.getLogger(__name__) if is_master() else None
+        
+        # ✅ 只在主进程开启 TensorBoard Writer
+        self.writer = SummaryWriter(log_dir=os.path.join(exp_dir, 'tb_logs')) if is_master() else None
+
+    def train(self):
+        for epoch in range(self.start_epoch, self.total_epochs):
+            if self.world_size > 1:
+                self.train_loader.sampler.set_epoch(epoch)
+                
+            self.model.train()
+            
+            for batch_idx, data in enumerate(self.train_loader):
+                self.global_step += 1
+                
+                imgs = data['lr'].to(self.device)
+                hr_targets = data['hr'].to(self.device)
+                mv_fwd = data['mv_fwd'].to(self.device)
+                field_ids = data['field_ids'].to(self.device)
+                
+                self.optimizer.zero_grad()
+                
+                with autocast():
+                    outputs = self.model(imgs, mv_fwd, field_ids)
+                    
+                   
+                    
+                    targets = {'hr': hr_targets}
+                    loss_dict = self.loss_aggregator(outputs, targets, epoch)
+                    total_loss = loss_dict['total_loss']
+                
+                # 反向传播
+                self.scaler.scale(total_loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+                
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                
+                # ✅ 步进：调度器更新学习率
+                self.scheduler.step()
+                
+                # ✅ 步进：更新 EMA 影子模型的权重
+                self.ema.update(self.model)
+                
+                # =======================================================
+                # 日志与可视化 (只在主进程 Rank 0 运行)
+                # =======================================================
+                if is_master():
+                    # 1. 每 50 步打印一次 Loss 曲线
+                    if self.global_step % self.cfg.train.log_freq == 0:
+                        loss_str = ", ".join([f"{k}: {v.item():.4f}" for k, v in loss_dict.items()])
+                        lr_current = self.optimizer.param_groups[0]['lr']
+                        self.logger.info(f"Ep [{epoch}/{self.total_epochs}] Iter [{batch_idx}/{len(self.train_loader)}] LR: {lr_current:.2e} | {loss_str}")
+                        
+                        # 写入 TensorBoard 折线图
+                        for k, v in loss_dict.items():
+                            self.writer.add_scalar(f"Loss/{k}", v.item(), self.global_step)
+                        self.writer.add_scalar("Train/LearningRate", lr_current, self.global_step)
+                    
+                    # 2. ✅ 每 500 步在 TensorBoard 画一次对比图 (Image Logging)
+                    if self.global_step % 500 == 0:
+                        # 抽取 Batch 里第 0 个视频的中间一帧 (T//2) 来展示
+                        T_mid = imgs.shape[1] // 2 
+                        
+                        # 取出画面并规范化到 0~1 之间
+                        lr_img = imgs[0, T_mid] # [3, H, W]
+                        # 把 LR 强行拉大到 HR 尺寸，方便并排对比
+                        lr_up = F.interpolate(lr_img.unsqueeze(0), scale_factor=2, mode='nearest').squeeze(0) 
+                        
+                        sr_img = torch.clamp(outputs['sr'][0, T_mid], 0, 1)
+                        hr_img = hr_targets[0, T_mid]
+                        
+                        # 把 LR_up, SR(预测), HR(真值) 横向拼接成一张长图
+                        # 拼接顺序：左(输入渣画质) -> 中(模型预测) -> 右(标准答案)
+                        grid_img = torch.cat([lr_up, sr_img, hr_img], dim=2) 
+                        self.writer.add_image('Visual_LR_SR_HR', grid_img, self.global_step)
+
+            # Epoch 结束，全员同步
+            if self.world_size > 1:
+                dist.barrier()
+
+            # 保存模型
+            if is_master():
+                self.save_checkpoint(epoch)
+
+        if is_master() and self.writer is not None:
+            self.writer.close()
+
+    def save_checkpoint(self, epoch):
+        model_state = self.model.module.state_dict() if self.world_size > 1 else self.model.state_dict()
+        save_path = os.path.join(self.exp_dir, f"epoch_{epoch}.pth")
+        
+        torch.save({
+            'epoch': epoch,
+            'state_dict': model_state,          # 原模型权重 (可用于继续训练)
+            'ema_state_dict': self.ema.module.state_dict(), # ✅ 保存 EMA 权重 (推理首选！)
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(), # ✅ 记得保存调度器状态
+            'scaler': self.scaler.state_dict(),
+        }, save_path)
+==================================================
+FILE: ./motionVectorDeinterlacing/apis/__init__.py
+==================================================
+from .train_runner import TrainRunner
+from .test_runner import test_runner
+==================================================
+FILE: ./motionVectorDeinterlacing/apis/test_runner.py
+==================================================
+# runners/test_runner.py
+import torch
+import math
+from tqdm import tqdm
+from motionVectorDeinterlacing.models.registry import ARCH_REGISTRY
+from datasets.builder import build_dataloader # 假设你有数据加载器
+
+def calculate_psnr(img1, img2):
+    """简单的 PSNR 计算，假设输入范围是 [0, 1]"""
+    mse = torch.mean((img1 - img2) ** 2)
+    if mse == 0:
+        return 100
+    return 20 * math.log10(1.0 / math.sqrt(mse))
+
+def test_runner(cfg):
+    print("📡 初始化 RealTimeMVDnet 评估流水线...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 1. 构建模型与数据
+    model = ARCH_REGISTRY.get('RealTimeMVDnet')(cfg.model).to(device)
+    # 加载权重
+    checkpoint = torch.load(cfg.test.weight_path, map_location=device)
+    model.load_state_dict(checkpoint.get('ema_state_dict', checkpoint['state_dict']))
+    
+    model.eval() # 开启评估模式 (触发返回单张量，并利用 h_fwd_cache)
+    
+    # 获取测试集的 DataLoader (必须按视频序列、按时间顺序返回数据)
+    # 注意：测试时 batch_size 必须为 1，以保证视频时序的严格对应！
+    test_loader = build_dataloader(cfg.dataset.test, world_size=1, rank=0)
+    
+    total_psnr = 0.0
+    total_frames = 0
+    
+    with torch.no_grad():
+        # 这里假设 dataloader 返回的字典中，包含了一个标识视频切换的标志 'is_new_video'
+        for data in tqdm(test_loader, desc="Testing"):
+            is_new_video = data.get('is_new_video', [False])[0]
+            
+            # 当切换到新测试视频时，必须清空网络记忆！
+            if is_new_video:
+                model.reset_state()
+            
+            # 数据上卡: 形状 [B=1, T, C, H, W]
+            imgs = data['lr'].to(device)
+            hr_targets = data['hr'].to(device)
+            mv_fwd = data['mv_fwd'].to(device)
+            field_ids = data['field_ids'].to(device)
+            
+            # 推理 (直接吞吐整个 Chunk)
+            sr_outs = model(imgs, mv_fwd, field_ids)
+            
+            # 计算 Chunk 内每一帧的 PSNR
+            B, T = sr_outs.shape[:2]
+            for t in range(T):
+                psnr = calculate_psnr(sr_outs[0, t], hr_targets[0, t])
+                total_psnr += psnr
+                total_frames += 1
+
+    avg_psnr = total_psnr / total_frames if total_frames > 0 else 0
+    print(f"✅ 测试完成！共评估 {total_frames} 帧，平均 PSNR: {avg_psnr:.2f} dB")
+
+# 可以在文件最下面写个小入口，方便独立运行
+if __name__ == "__main__":
+    # 解析参数和 config 的逻辑可以参考 train.py
+    pass
+==================================================
+FILE: ./motionVectorDeinterlacing/datasets/__init__.py
+==================================================
+from .reds_dataset import RedsDeintDataset
+from .builder import build_dataloader # 等下我们要新建这个文件
+==================================================
+FILE: ./motionVectorDeinterlacing/datasets/builder.py
+==================================================
+import torch
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from motionVectorDeinterlacing.models.registry import DATASET_REGISTRY, build_from_cfg
+from .reds_dataset import RedsDeintDataset # 触发注册
+
+DATASET_REGISTRY.register('RedsDeintDataset')(RedsDeintDataset)
+
+def build_dataloader(cfg_dataset, world_size, rank):
+    dataset = build_from_cfg(cfg_dataset, DATASET_REGISTRY)
+    
+    # DDP 核心：让不同显卡吃到不同的数据切片
+    if world_size > 1:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=(cfg_dataset.get('split') == 'train'))
+    else:
+        sampler = None
+        
+    dataloader = DataLoader(
+        dataset,
+        batch_size=cfg_dataset.get('batch_size', 1),
+        shuffle=(sampler is None and cfg_dataset.get('split') == 'train'),
+        sampler=sampler,
+        num_workers=cfg_dataset.get('num_workers', 4),
+        pin_memory=True
+    )
+    return dataloader
+==================================================
+FILE: ./motionVectorDeinterlacing/datasets/reds_dataset.py
+==================================================
+import os
+import glob
+import random
+import numpy as np
+import cv2
+import torch
+import lmdb
+import pickle
+import io
+from torch.utils.data import Dataset
+
+def to_tensor01(img):
+    """将 numpy array [H, W, C] 转换为张量 [C, H, W] 并归一化到 0~1"""
+    img = np.ascontiguousarray(img)
+    return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+
+class RedsDeintDataset(Dataset):
+    """
+    MVDNet 专属 Dataset (支持极速 LMDB 引擎)
+    """
+    def __init__(self, root_dir, split='train',
+                 seq_len=5, crop_lr=None, augment=False,
+                 img_tmpl="{:08d}.png", use_lmdb=True):  # ✅ 新增 use_lmdb 开关
+        
+        self.split = split
+        self.seq_len = seq_len 
+        self.crop_lr = crop_lr
+        self.augment = augment
+        self.img_tmpl = img_tmpl
+        self.use_lmdb = use_lmdb
+        
+        # 懒加载环境变量，防止 PyTorch 多进程死锁
+        self.env_codec = None
+        self.env_gt = None
+        
+        # 1. 目录路由
+        if split == 'train':
+            self.gt_root = os.path.join(root_dir, 'REDS_data_GT.lmdb' if use_lmdb else 'REDS_data_GT')
+            self.codec_root = os.path.join(root_dir, 'outputs_interlaced.lmdb' if use_lmdb else 'outputs_interlaced')
+        else:
+            self.gt_root = os.path.join(root_dir, 'REDS_data_GT_val.lmdb' if use_lmdb else 'REDS_data_GT_val')
+            self.codec_root = os.path.join(root_dir, 'outputs_val.lmdb' if use_lmdb else 'outputs_val') 
+            
+        if not os.path.exists(self.gt_root) or not os.path.exists(self.codec_root):
+            raise RuntimeError(f"数据路径不存在: {self.gt_root} 或 {self.codec_root}")
+
+        self.samples = []
+        
+        # 2. 获取数据列表 (通过 LMDB 的 meta_info 或 传统 glob)
+        if self.use_lmdb:
+            # ✅ 从 LMDB 打包时生成的 pickle 文件中读取所有 keys
+            meta_path = os.path.join(self.codec_root, 'meta_info.pkl')
+            with open(meta_path, 'rb') as f:
+                keys = pickle.load(f)
+            
+            # 提取出所有的 clip 名字 (例如从 '000/lr/00000000.png' 提取出 '000')
+            lr_keys = [k for k in keys if '/lr/' in k]
+            self.clips = sorted(list(set([k.split('/')[0] for k in lr_keys])))
+            
+            # 计算每个 clip 有多少帧
+            for clip in self.clips:
+                clip_frames = [k for k in lr_keys if k.startswith(f"{clip}/lr/")]
+                total_frames = len(clip_frames)
+                if total_frames >= self.seq_len:
+                    for s in range(0, total_frames - self.seq_len + 1):
+                        self.samples.append((clip, s))
+        else:
+            # 传统文件夹遍历方式
+            self.clips = sorted([d for d in os.listdir(self.codec_root) if os.path.isdir(os.path.join(self.codec_root, d))])
+            for clip in self.clips:
+                lr_dir = os.path.join(self.codec_root, clip, "lr")
+                total_frames = len(glob.glob(os.path.join(lr_dir, "*.png")))
+                if total_frames >= self.seq_len:
+                    for s in range(0, total_frames - self.seq_len + 1):
+                        self.samples.append((clip, s))
+
+        print(f"[{split.upper()}] Dataset loaded: {len(self.samples)} samples from {len(self.clips)} clips. (LMDB: {self.use_lmdb})")
+
+    def _init_lmdb(self):
+        """懒加载：只在第一个 batch 被读取时，由当前 Worker 进程打开 LMDB 环境"""
+        if self.env_codec is None:
+            self.env_codec = lmdb.open(self.codec_root, readonly=True, lock=False, readahead=False, meminit=False)
+        if self.env_gt is None:
+            self.env_gt = lmdb.open(self.gt_root, readonly=True, lock=False, readahead=False, meminit=False)
+
+    def _read_img(self, env, root, rel_path):
+        """统一读取图片接口"""
+        if self.use_lmdb:
+            with env.begin(write=False) as txn:
+                buf = txn.get(rel_path.encode('ascii'))
+                if buf is None: raise ValueError(f"LMDB Key not found: {rel_path}")
+                img_np = np.frombuffer(buf, dtype=np.uint8)
+                img = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+        else:
+            img = cv2.imread(os.path.join(root, rel_path), cv2.IMREAD_COLOR)
+            if img is None: raise FileNotFoundError(f"File not found: {os.path.join(root, rel_path)}")
+            
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    def _load_seq(self, clip, start):
+        # 确保 LMDB 在当前进程已打开
+        if self.use_lmdb: self._init_lmdb()
+
+        imgs_lr, imgs_gt, mv_fwd_list = [], [], []
+
+        # 1. 读取场极性标识 (npy)
+        fid_rel_path = f"{clip}/meta/field_ids.npy"
+        if self.use_lmdb:
+            with self.env_codec.begin(write=False) as txn:
+                buf = txn.get(fid_rel_path.encode('ascii'))
+                with io.BytesIO(buf) as f:
+                    all_fids = np.load(f)
+        else:
+            all_fids = np.load(os.path.join(self.codec_root, fid_rel_path))
+            
+        indices = [start + i for i in range(self.seq_len)]
+        seq_fids = all_fids[indices] 
+
+        for t_idx in indices:
+            fn = self.img_tmpl.format(t_idx)
+            
+            # 读取 LR 和 GT 图像
+            lr_rel_path = f"{clip}/lr/{fn}"
+            gt_rel_path = f"{clip}/{fn}" # 假设 GT 里面直接是 png
+            
+            imgs_lr.append(self._read_img(self.env_codec, self.codec_root, lr_rel_path))
+            imgs_gt.append(self._read_img(self.env_gt, self.gt_root, gt_rel_path))
+            
+            H_lr, W_lr, _ = imgs_lr[-1].shape
+            base_name = os.path.splitext(fn)[0] 
+
+            # 2. 读取光流 (npz)
+            mvf_rel_path = f"{clip}/mv_fwd/{base_name}_mv_fwd.npz"
+            mvf = np.zeros((2, H_lr, W_lr), np.float32) # 默认全 0，容错机制
+            
+            if self.use_lmdb:
+                with self.env_codec.begin(write=False) as txn:
+                    buf = txn.get(mvf_rel_path.encode('ascii'))
+                    if buf is not None:
+                        with io.BytesIO(buf) as f:
+                            f_arr = np.load(f)["flow_fwd"].astype(np.float32)
+                            if f_arr.ndim == 3 and f_arr.shape[2] == 2: 
+                                f_arr = np.transpose(f_arr, (2, 0, 1))
+                            mvf = f_arr
+            else:
+                p_fwd = os.path.join(self.codec_root, mvf_rel_path)
+                if os.path.exists(p_fwd):
+                    f_arr = np.load(p_fwd)["flow_fwd"].astype(np.float32)
+                    if f_arr.ndim == 3 and f_arr.shape[2] == 2: 
+                        f_arr = np.transpose(f_arr, (2, 0, 1))
+                    mvf = f_arr
+                    
+            mv_fwd_list.append(mvf)
+
+        return (
+            np.stack(imgs_lr, axis=0),      # [T, H, W, 3]
+            np.stack(imgs_gt, axis=0),      # [T, H*2, W, 3]
+            np.stack(mv_fwd_list, axis=0),  # [T, 2, H, W]
+            seq_fids                        # [T]
+        )
+
+    # ... 下面的 _random_crop, __getitem__, __len__ 完全保持你原来的代码不变 ...
+    def _random_crop(self, lr, gt, mv_fwd):
+        T, H_in, W, _ = lr.shape 
+        crop_h = self.crop_lr 
+        crop_w = self.crop_lr
+
+        if crop_h is None or H_in < crop_h or W < crop_w:
+            return lr, gt, mv_fwd
+
+        y0 = random.randint(0, H_in - crop_h)
+        x0 = random.randint(0, W - crop_w)
+
+        lr = lr[:, y0 : y0+crop_h, x0 : x0+crop_w, :]
+        mv_fwd = mv_fwd[:, :, y0 : y0+crop_h, x0 : x0+crop_w]
+        
+        gt_y0 = y0 * 2
+        gt_crop_h = crop_h * 2
+        gt = gt[:, gt_y0 : gt_y0+gt_crop_h, x0 : x0+crop_w, :]
+
+        return lr, gt, mv_fwd
+
+    def __getitem__(self, idx):
+        clip, s = self.samples[idx]
+        lr, gt, mv_fwd, fids = self._load_seq(clip, s)
+
+        if self.split == 'train':
+            if self.crop_lr is not None:
+                lr, gt, mv_fwd = self._random_crop(lr, gt, mv_fwd)
+            
+            if self.augment and random.random() < 0.5:
+                lr = lr[:, :, ::-1, :].copy()
+                gt = gt[:, :, ::-1, :].copy()
+                mv_fwd = mv_fwd[:, :, :, ::-1].copy()
+                mv_fwd[:, 0, :, :] *= -1.0 
+
+        imgs_t = torch.stack([to_tensor01(im) for im in lr], dim=0)  
+        gts_t  = torch.stack([to_tensor01(im) for im in gt], dim=0)  
+        mv_fwd_t = torch.from_numpy(np.ascontiguousarray(mv_fwd)).float()
+        fids_t = torch.from_numpy(np.ascontiguousarray(fids)).long()
+        
+        return {
+            'lr': imgs_t,               
+            'hr': gts_t,                
+            'mv_fwd': mv_fwd_t,         
+            'field_ids': fids_t,        
+            'is_new_video': (s == 0),   
+            'clip_name': clip,
+            'start_frame': s
+        }
+
+    def __len__(self):
+        return len(self.samples)
+==================================================
+FILE: ./motionVectorDeinterlacing/utils/utils_flow.py
+==================================================
+# process motion vector for warping: 
+# 1.from H.264 raw（1/4 pel） to pixel, 
+# 2.and apply vertical physical corrections
+
+import torch
+
+def quarterPixelMV_to_pixelMV(raw_mv):
+    """
+    [原子操作 1]
+    将 H.264 原始运动矢量 (1/4 像素单位) 转换为实际像素单位。
+    
+    Args:
+        raw_mv (Tensor): [B, 2, H, W]
+    Returns:
+        Tensor: 像素单位的 MV
+    """
+    # 这里的 .float() 是为了保险，防止传入的是 int 类型导致无法除出小数
+    return raw_mv.float() / 4.0
+
+
+# 替换 utils_flow.py 中的函数定义：
+def rescale_mv_temporal(mv, src_oe=None, tgt_oe=None, scale=0.5, correct_offset=True):
+    mv = mv * scale
+    
+    # ✅ 加入判断：只有传了极性且要求修正，才执行物理偏移
+    if correct_offset and src_oe is not None and tgt_oe is not None:
+        mask = (src_oe != tgt_oe).view(-1, 1, 1, 1).float()
+        offset = torch.where(tgt_oe.view(-1, 1, 1, 1) == 1, 0.5, -0.5)
+        mv_corrected = mv.clone()
+        mv_corrected[:, 1:2, :, :] += (mask * offset)
+        return mv_corrected
+        
+    return mv
+==================================================
+FILE: ./motionVectorDeinterlacing/utils/ema.py
+==================================================
+import torch
+import copy
+
+class ModelEMA:
+    """
+    指数移动平均 (Exponential Moving Average)
+    平滑模型参数，极大稳定视频生成的时域连贯性，提升 PSNR。
+    """
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        # 剥离 DDP 外壳（如果有）
+        m_base = model.module if hasattr(model, 'module') else model
+        # 深度拷贝一份模型作为 EMA 影子
+        self.module = copy.deepcopy(m_base).eval()
+        
+        # 影子模型不需要计算梯度
+        for param in self.module.parameters():
+            param.requires_grad = False
+
+    @torch.no_grad()
+    def update(self, model):
+        # 取出当前主模型的真实权重
+        m_base = model.module if hasattr(model, 'module') else model
+        
+        # 核心 EMA 平滑更新公式
+        for ema_p, m_p in zip(self.module.parameters(), m_base.parameters()):
+            ema_p.data.mul_(self.decay).add_(m_p.data, alpha=1 - self.decay)
+==================================================
+FILE: ./motionVectorDeinterlacing/utils/__init__.py
+==================================================
+from .distributionUtil import init_dist, get_dist_info, is_master
+from .ema import ModelEMA
+from .logger import get_root_logger
+from .ops import mv_warp, default_init_weights
+from .utils_flow import quarterPixelMV_to_pixelMV, rescale_mv_temporal
+from .visualize_flow import flow_to_color
+==================================================
+FILE: ./motionVectorDeinterlacing/utils/distributionUtil.py
+==================================================
+import os
+import torch
+import torch.distributed as dist
+
+def init_dist(local_rank=-1, backend='nccl'):
+    """初始化 DDP 环境"""
+    if dist.is_initialized():
+        return
+    
+    # 适配 torchrun / python -m torch.distributed.launch
+    if local_rank == -1:
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend=backend)
+
+def get_dist_info():
+    """获取当前进程的 rank 和总进程数"""
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        rank = 0
+        world_size = 1
+    return rank, world_size
+
+def is_master():
+    """判断是否为主进程 (用于打印日志和保存模型)"""
+    rank, _ = get_dist_info()
+    return rank == 0
+==================================================
+FILE: ./motionVectorDeinterlacing/utils/logger.py
+==================================================
+import logging
+import os
+from .distributionUtil import is_master
+
+def get_root_logger(logger_name='MVDNet', log_file=None, log_level=logging.INFO):
+    logger = logging.getLogger(logger_name)
+    # 如果已经配置过，直接返回，防止重复打印
+    if logger.hasHandlers():
+        return logger
+        
+    logger.setLevel(log_level)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+    # 只有 Rank 0 的主进程才允许输出日志，防止多卡打印刷屏
+    if is_master():
+        # 1. 终端输出
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+        
+        # 2. 文件输出
+        if log_file is not None:
+            file_handler = logging.FileHandler(log_file, mode='w')
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+            
+    return logger
+==================================================
+FILE: ./motionVectorDeinterlacing/utils/ops.py
+==================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def mv_warp(x, flow, padding_mode='border', align_corners=True):
+    """
+    这就相当于你那个 MVWarp 的纯函数版本
+    """
+    B, C, H, W = x.shape
+    
+    # 1. 生成基础网格
+    ys = torch.linspace(-1, 1, H, device=x.device)
+    xs = torch.linspace(-1, 1, W, device=x.device)
+    yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+    grid = torch.stack([xx, yy], dim=-1).unsqueeze(0) # (1, H, W, 2)
+    
+    # 2. 加上归一化后的光流
+    vgrid = grid + torch.stack([
+        flow[:, 0] * (2.0 / (W - 1)), 
+        flow[:, 1] * (2.0 / (H - 1))
+    ], dim=-1)
+    
+    # 3. 采样返回
+    return F.grid_sample(x, vgrid, mode='bilinear', 
+                         padding_mode=padding_mode, 
+                         align_corners=align_corners)
+
+def default_init_weights(module, scale=1, act_cfg=None):
+    """
+    根据 act_cfg 自动匹配 Kaiming 初始化参数
+    act_cfg 可以是字符串 "ReLU" 或 字典 {"type": "LeakyReLU", "negative_slope": 0.1}
+    """
+    # 1. 解析配置，提取初始化参数
+    nonlinearity = 'relu'
+    a = 0
+    
+    if act_cfg is not None:
+        if isinstance(act_cfg, str):
+            act_type = act_cfg
+        else:
+            act_type = act_cfg.get('type', 'ReLU')
+            a = act_cfg.get('negative_slope', 0) # 针对 LeakyReLU
+            # 如果是 PReLU，虽然 a 是学习出来的，但初始化通常参考 0.25 或 0
+            if act_type == 'PReLU':
+                a = act_cfg.get('init', 0.25) 
+        
+        # 映射到 PyTorch init 的命名规范
+        mapping = {
+            'ReLU': 'relu',
+            'LeakyReLU': 'leaky_relu',
+            'PReLU': 'leaky_relu', # PReLU 在初始化数学上接近 leaky_relu
+            'Tanh': 'tanh',
+            'Sigmoid': 'sigmoid'
+        }
+        nonlinearity = mapping.get(act_type, 'relu')
+
+    # 2. 遍历并初始化
+    for m in module.modules():
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            nn.init.kaiming_normal_(
+                m.weight, 
+                a=a, 
+                mode='fan_in', 
+                nonlinearity=nonlinearity
+            )
+            m.weight.data *= scale
+            if m.bias is not None:
+                m.bias.data.zero_()
+==================================================
+FILE: ./motionVectorDeinterlacing/utils/visualize_flow.py
+==================================================
+import cv2
+import numpy as np
+
+def flow_to_color(flow_tensor, max_val=None):
+    """
+    将 [2, H, W] 的光流 Tensor 转为 HWC 的 RGB 图像用于保存
+    """
+    flow = flow_tensor.detach().cpu().numpy().transpose(1, 2, 0)
+    h, w = flow.shape[:2]
+    
+    # 转换为极坐标 (角度代表颜色，长度代表亮度)
+    mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+    
+    hsv = np.zeros((h, w, 3), dtype=np.uint8)
+    hsv[..., 0] = ang * 180 / np.pi / 2 # 色相 (0-180)
+    hsv[..., 1] = 255                   # 饱和度最大
+    
+    if max_val is None:
+        max_val = np.max(mag) + 1e-6
+    hsv[..., 2] = np.clip(mag * 255 / max_val, 0, 255) # 亮度反映运动大小
+    
+    rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+    return rgb
+==================================================
+FILE: ./motionVectorDeinterlacing/utils/get_flops.py
+==================================================
+import torch
+from thop import profile
+from models.mvd_net import RealTimeMVDnet # 替换为你的路径
+from config.config_schema import MVDNetConfig
+
+def measure_flops_and_params(model, input_shape, device='cuda'):
+    # 构造假数据
+    B, T, C, H, W = input_shape
+    imgs = torch.randn(B, T, C, H, W).to(device)
+    mvs = torch.randn(B, T, 2, H, W).to(device)
+    fids = torch.zeros(B, T).long().to(device)
+    
+    # 使用 thop 计算
+    flops, params = profile(model, inputs=(imgs, mvs, fids), verbose=False)
+    
+    print(f"Total Params: {params / 1e6:.2f} M")
+    print(f"Total FLOPs : {flops / 1e9:.2f} G MACs (For T={T} frames)")
+
+# 运行: measure_flops_and_params(model.eval(), (1, 5, 3, 540, 960))
+==================================================
+FILE: ./motionVectorDeinterlacing/models/registry.py
+==================================================
+# motionVectorDeinterlacing/registry.py
+
+class Registry:
+    def __init__(self, name):
+        """
+        初始化注册表
+        Args:
+            name (str): 注册表的名字，比如 'arch', 'backbone'，用于报错时提示
+        """
+        self._name = name
+        self._module_dict = {}
+
+    def register(self, name=None):
+        """
+        装饰器工厂。
+        Args:
+            name (str, optional): 指定别名。如果不填，默认用类名。
+        """
+        # --- 第一层：接收别名 ---
+        def _register(cls):
+            # --- 第二层：接收类 ---
+            
+            # 1. 确定 Key（名字）
+            key = name if name is not None else cls.__name__
+            
+            # 2. 安全检查：防止你不小心注册了两个重名的类
+            if key in self._module_dict:
+                raise KeyError(f"{key} 已经在 {self._name} 注册表中存在了！请检查是否重名。")
+            
+            # 3. 登记
+            self._module_dict[key] = cls
+            
+            # 4. 必须原样返回类，否则类就无法实例化了
+            return cls
+
+        return _register
+
+    def get(self, key):
+        """查表方法"""
+        cls = self._module_dict.get(key)
+        if cls is None:
+            raise KeyError(f"在 {self._name} 注册表中找不到 '{key}'。请检查拼写或是否 import 了该文件。")
+        return cls
+
+# =========================================
+# 实例化five个注册表对象
+# =========================================
+ARCH_REGISTRY = Registry('arch')
+COMPONENT_REGISTRY = Registry('component')
+ACTIVATION_REGISTRY = Registry('activation')
+LOSS_REGISTRY = Registry('loss')
+DATASET_REGISTRY = Registry('dataset')
+
+def build_from_cfg(cfg, registry):
+    """
+    Args:
+        cfg (dict | BaseModel | str): 配置字典/Pydantic模型/字符串别名
+        registry (Registry): 注册表对象
+    """
+    # 1. 兼容 Pydantic (V2 版本用 model_dump, V1 版本用 dict)
+    if hasattr(cfg, 'model_dump'):
+        cfg = cfg.model_dump()
+    elif hasattr(cfg, 'dict'):
+        cfg = cfg.dict()
+
+    # 2. 如果传来的是个字符串（比如 cfg='ReLU'），自动包装成字典
+    if isinstance(cfg, str):
+        cfg = {'type': cfg}
+
+    if not isinstance(cfg, dict):
+        raise TypeError(f"cfg 必须是 字典/Pydantic模型/字符串，但收到了 {type(cfg)}")
+    
+    if 'type' not in cfg:
+        raise KeyError(f"配置中缺少 'type' 字段 (用于查表导航): {cfg}")
+    
+    args = cfg.copy()
+    obj_type = args.pop('type')
+    obj_cls = registry.get(obj_type)
+    
+    return obj_cls(**args)
+==================================================
+FILE: ./motionVectorDeinterlacing/models/__init__.py
+==================================================
+from .registry import ARCH_REGISTRY, COMPONENT_REGISTRY, ACTIVATION_REGISTRY, LOSS_REGISTRY
+from .architectures import *
+from .backbones import *
+from .components import *
+from .losses import *
+from .modules import *
+==================================================
+FILE: ./motionVectorDeinterlacing/models/losses/__init__.py
+==================================================
+from .losses import CharbonnierLoss, FieldAwareMaskedTemporalLoss, FlowLoss, StaticBackgroundLoss, MVDNetLossAggregator
+==================================================
+FILE: ./motionVectorDeinterlacing/models/losses/losses.py
+==================================================
+# models/losses.py
+from motionVectorDeinterlacing.models.registry import COMPONENT_REGISTRY
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .registry import LOSS_REGISTRY
+from motionVectorDeinterlacing.utils.ops import mv_warp # 1. 修正导入
+
+# ==========================================
+# 1. 基础图像重建 Loss (Charbonnier)
+# ==========================================
+@LOSS_REGISTRY.register('CharbonnierLoss')
+class CharbonnierLoss(nn.Module):
+    """
+    比 L1 更平滑，比 L2 更鲁棒。SR 任务的标准配置。
+    """
+    def __init__(self, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, pred, target):
+        diff = pred - target
+        loss = torch.sqrt(diff * diff + self.eps)
+        return loss.mean()
+
+
+# ==========================================
+# 2. 场感知时域对齐 Loss (Field-Aware Temporal Loss)
+# ==========================================
+@LOSS_REGISTRY.register('FieldAwareMaskedTemporalLoss')
+class FieldAwareMaskedTemporalLoss(nn.Module):
+    def __init__(self): 
+        super().__init__()
+
+    def forward(self, sr_imgs, flows, masks=None):
+        # sr_imgs: [B, T, 3, 2H, W] (拼接好的逐行全高清图)
+        # flows: [B, T, 2, H, W] (原始隔行大小的流)
+        B, T, _, H2, W = sr_imgs.shape 
+        H = H2 // 2
+        
+        loss_temporal = 0.0
+        for t in range(1, T):
+            curr_sr = sr_imgs[:, t]      # 当前高清帧
+            prev_sr = sr_imgs[:, t-1]    # 前一高清帧
+            
+            # 将物理场光流拉伸到高清尺寸
+            flow_t = flows[:, t]
+            flow_hr = F.interpolate(flow_t, size=(H2, W), mode='bilinear', align_corners=False).clone()
+            flow_hr[:, 1] *= 2.0 # 高度拉伸了两倍，Y方向光流幅度也要乘2
+            
+            mask_hr = 1.0
+            if masks is not None:
+                mask_hr = F.interpolate(masks[:, t].unsqueeze(1), size=(H2, W), mode='bilinear', align_corners=False).squeeze(1)
+            
+            warped_prev = mv_warp(prev_sr, flow_hr) 
+            diff = torch.abs(curr_sr - warped_prev)
+            loss_temporal += (diff * mask_hr).mean()
+
+        return loss_temporal / (T - 1)
+
+
+@LOSS_REGISTRY.register('MVDNetLossAggregator')
+class MVDNetLossAggregator(nn.Module):
+    # __init__ 保持你原来的不变...
+    # ...
+    def forward(self, outputs, targets, epoch):
+        loss_dict = {}
+        total_loss = 0.0
+        
+        l_char = self.char_loss(outputs['sr'], targets['hr'])
+        loss_dict['l_char'] = l_char * self.w_char
+        total_loss += loss_dict['l_char']
+
+        flows = outputs['flows']
+        lr_imgs = outputs['lr_imgs']
+
+        if epoch >= self.start_flow:
+            l_photo, l_smooth = self.flow_loss(flows, lr_imgs)
+            loss_dict['l_flow'] = (l_photo + l_smooth) * self.w_flow
+            total_loss += loss_dict['l_flow']
+
+        if epoch >= self.start_temp and self.w_temp > 0.0:
+            l_temp = self.temp_loss(outputs['sr'], flows, outputs.get('masks'))
+            loss_dict['l_temp'] = l_temp * self.w_temp
+            total_loss += loss_dict['l_temp']
+            
+        if epoch >= self.start_pp:
+            l_pp = self.pp_loss(outputs['sr'], flows)
+            loss_dict['l_pp'] = l_pp * self.w_pp
+            total_loss += loss_dict['l_pp']
+
+        loss_dict['total_loss'] = total_loss
+        return loss_dict
+
+# ==========================================
+# 3. 光流约束 Loss (FlowLoss)
+# ==========================================
+@LOSS_REGISTRY.register('FlowLoss')
+class FlowLoss(nn.Module):
+    """
+    【自监督约束】包含光度一致性和图像指导的光流平滑。
+    必须传入纯粹的“场”图像，禁止传入交错帧，防止梯度爆炸。
+    """
+    def __init__(self):
+        super().__init__()
+      
+
+    def gradient(self, data):
+        D_dy = data[:, :, 1:] - data[:, :, :-1]
+        D_dx = data[:, :, :, 1:] - data[:, :, :, :-1]
+        return D_dx, D_dy
+
+    def smooth_loss(self, flow, img):
+        flow_dx, flow_dy = self.gradient(flow)
+        img_dx, img_dy = self.gradient(img)
+        weights_x = torch.exp(-torch.mean(torch.abs(img_dx), 1, keepdim=True))
+        weights_y = torch.exp(-torch.mean(torch.abs(img_dy), 1, keepdim=True))
+        return (torch.abs(flow_dx) * weights_x).mean() + (torch.abs(flow_dy) * weights_y).mean()
+
+    def forward(self, refined_flows, imgs, conf_masks=None):
+        B, T, _, H, W = refined_flows.shape
+        loss_smooth, loss_photo = 0.0, 0.0
+        
+        for t in range(T):
+            flow = refined_flows[:, t]
+            curr_img = imgs[:, t]
+            loss_smooth += self.smooth_loss(flow, curr_img)
+            
+            if t > 0: 
+                prev_img = imgs[:, t-1] 
+                warped_prev = mv_warp(prev_img, flow)
+                diff = torch.sqrt((curr_img - warped_prev)**2 + 1e-6)
+                
+                if conf_masks is not None:
+                    mask = conf_masks[:, t] 
+                    if mask.shape[-2:] != diff.shape[-2:]:
+                        mask = F.interpolate(mask, size=diff.shape[-2:], mode='bilinear')
+                    diff = diff * mask
+                    
+                loss_photo += diff.mean()
+            
+        return loss_photo / (T - 1), loss_smooth / T
+
+
+# ==========================================
+# 4. 跳帧静态背景稳定性 Loss (Static Background)
+# ==========================================
+@LOSS_REGISTRY.register('StaticBackgroundLoss')
+class StaticBackgroundLoss(nn.Module):
+    """
+    【抗闪烁约束】强制远距离帧（t-2, t+2）在静态背景下保持一致。
+    """
+    def __init__(self, motion_sensitivity=0.5): 
+        super().__init__()
+        self.motion_sensitivity = motion_sensitivity
+
+    def forward(self, sr_imgs, ref_flows):
+        loss = 0.0
+        B, T, C, H, W = sr_imgs.shape
+        
+        for t in range(2, T - 2):
+            curr = sr_imgs[:, t]
+            # 运动强度指示器（用单场光流做近似判断即可）
+            flow_mag = torch.sum(ref_flows[:, t]**2, dim=1, keepdim=True)
+            flow_mag_hr = F.interpolate(flow_mag, size=(H, W), mode='bilinear')
+            static_weight = torch.exp(-self.motion_sensitivity * flow_mag_hr)
+            
+            loss += (torch.abs(curr - sr_imgs[:, t-2]) * static_weight).mean()
+            loss += (torch.abs(curr - sr_imgs[:, t+2]) * static_weight).mean()
+            
+        return loss / (T - 4 + 1e-8)
+
+
+# ==========================================
+# 5. MVDNet 损失总线 (Loss Aggregator)
+# ==========================================
+@LOSS_REGISTRY.register('MVDNetLossAggregator')
+class MVDNetLossAggregator(nn.Module):
+    """
+    完全由 Config 驱动的 Loss 总包工头，实现课程学习、动态权重调节与 Top/Bot 场分离解耦。
+    """
+    def __init__(self, loss_cfg):
+        super().__init__()
+        
+        # 1. 提取配置
+        char_cfg = loss_cfg.get('charbonnier', {})
+        flow_cfg = loss_cfg.get('flow', {})
+        temp_cfg = loss_cfg.get('temporal', {})
+        pp_cfg = loss_cfg.get('pingpong', {})
+
+        # 2. 读取权重参数
+        self.w_char = char_cfg.get('weight', 1.0)
+        self.w_flow = flow_cfg.get('weight', 0.05)
+        self.w_temp = temp_cfg.get('weight', 0.1) # 若想先跑通基线，在 config.yml 设为 0.0 即可
+        self.w_pp = pp_cfg.get('weight', 0.5)
+
+        # 3. 读取开启轮次
+        self.start_flow = flow_cfg.get('start_epoch', 50)
+        self.start_temp = temp_cfg.get('start_epoch', 150)
+        self.start_pp = pp_cfg.get('start_epoch', 300)
+        
+        motion_sens = pp_cfg.get('motion_sensitivity', 0.5)
+
+        # 4. 实例化裁判员
+        self.char_loss = CharbonnierLoss()
+        self.flow_loss = FlowLoss()
+        self.temp_loss = FieldAwareMaskedTemporalLoss() # <--- 升级版
+        self.pp_loss = StaticBackgroundLoss(motion_sensitivity=motion_sens)
+
+    
+def forward(self, outputs, targets, epoch):
+        loss_dict = {}
+        total_loss = 0.0
+        
+        l_char = self.char_loss(outputs['sr'], targets['hr'])
+        loss_dict['l_char'] = l_char * self.w_char
+        total_loss += loss_dict['l_char']
+
+        flows = outputs['flows']
+        lr_imgs = outputs['lr_imgs']
+
+        if epoch >= self.start_flow:
+            l_photo, l_smooth = self.flow_loss(flows, lr_imgs)
+            loss_dict['l_flow'] = (l_photo + l_smooth) * self.w_flow
+            total_loss += loss_dict['l_flow']
+
+        if epoch >= self.start_temp and self.w_temp > 0.0:
+            l_temp = self.temp_loss(outputs['sr'], flows, outputs.get('masks'))
+            loss_dict['l_temp'] = l_temp * self.w_temp
+            total_loss += loss_dict['l_temp']
+            
+        if epoch >= self.start_pp:
+            l_pp = self.pp_loss(outputs['sr'], flows)
+            loss_dict['l_pp'] = l_pp * self.w_pp
+            total_loss += loss_dict['l_pp']
+
+        loss_dict['total_loss'] = total_loss
+        return loss_dict
+==================================================
+FILE: ./motionVectorDeinterlacing/models/architectures/__init__.py
+==================================================
+from .mvd_net import RealTimeMVDnet
+==================================================
+FILE: ./motionVectorDeinterlacing/models/architectures/mvd_net.py
+==================================================
+import torch # tensor manipulation, equipment management, math operations 
+import torch.nn as nn # neural network layers, activiation function, sequential containers
+# import registry
+import torch.nn.functional as F # functional API for activations, pooling, etc.
+
+from motionVectorDeinterlacing.models.registry import (
+    ARCH_REGISTRY, 
+    COMPONENT_REGISTRY,
+    build_from_cfg,
+)
+# 基础组件与算子 (合并重复的 ops 导入)
+from motionVectorDeinterlacing.utils.ops import mv_warp, default_init_weights 
+import motionVectorDeinterlacing.models.modules.gmc
+from motionVectorDeinterlacing.utils.utils_flow import (
+    quarterPixelMV_to_pixelMV, 
+    rescale_mv_temporal
+)
+from config.config_schema import MVDNetConfig # for pydantic type checking
+from motionVectorDeinterlacing.models import backbones, components    
+
+
+@ARCH_REGISTRY.register('RealTimeMVDnet')
+class RealTimeMVDnet(nn.Module):    
+    def __init__(self, cfg: MVDNetConfig):
+        super().__init__()
+        self.mid = cfg.mid
+        self.lookahead = cfg.lookahead 
+        self.prop_order = cfg.propagation_order
+        self.feat_extract = build_from_cfg(cfg.feature_extractor_cfg, COMPONENT_REGISTRY)
+        self.mv_refiner = build_from_cfg(cfg.mv_refiner_cfg, COMPONENT_REGISTRY)
+        self.gmc = build_from_cfg(cfg.gmc_cfg, COMPONENT_REGISTRY) # 全局运动补偿模块
+
+        # 双向传播模块
+        backward_blocks = [
+            build_from_cfg(cfg.residual_block_cfg, COMPONENT_REGISTRY)
+            for _ in range(cfg.num_blocks)
+        ]
+        self.backward_resblocks = nn.Sequential(*backward_blocks)
+
+        forward_blocks = [
+            build_from_cfg(cfg.residual_block_cfg, COMPONENT_REGISTRY)
+            for _ in range(cfg.num_blocks)
+        ]
+        self.forward_resblocks = nn.Sequential(*forward_blocks)
+        
+        # 融合与重建
+
+        self.foward_backward_fusion = build_from_cfg(
+            cfg.foward_backward_fusion_cfg, COMPONENT_REGISTRY,
+        ) #fusion of forward and backward features
+        
+        self.h_prop_current_feat_fusion = build_from_cfg(
+            cfg.h_prop_current_feat_fusion_cfg, COMPONENT_REGISTRY,
+        ) #fusion of current frame feature and h_prop 
+        self.first_2nd_order_fusion = build_from_cfg(
+            cfg.first_2nd_order_fusion_cfg, COMPONENT_REGISTRY,
+        ) #fusion of 1-order and 2-order motion features
+        
+
+        self.refinement = nn.Sequential(
+            nn.Conv2d(self.mid, self.mid, 3, 1, 1),
+            nn.LeakyReLU(0.1, True)
+        )
+        self.deint_up = build_from_cfg(cfg.deint_up_cfg, COMPONENT_REGISTRY)
+        self.last_conv = nn.Conv2d(self.mid, 3, 3, 1, 1)
+
+        # 核心护城河：全局前向隐状态缓存 (仅在推理模式下有效)
+        self.register_buffer('h_fwd_cache', None)
+
+        self.init_weights()
+
+    def init_weights(self):
+        default_init_weights(self, scale=1.0) 
+        # 【第二轮特殊定制】：遍历全网，如果哪个子模块有专属要求，让它自己覆盖！
+        # self.modules() 会递归查找所有的子组件、孙子组件
+        for name, module in self.modules():
+            # 动态检查这个组件有没有定义特殊的初始化方法
+            if hasattr(module, '_init_special_weights'):
+                module._init_special_weights()
+
+    def reset_state(self):
+        """流式处理开始前，或切换视频流通道时，必须调用此函数清空历史记忆"""
+        # 缓存结构: (h_tm1, h_tm2, feat_tm1, feat_tm2)
+        self.h_fwd_cache = None
+
+    def _refine_mv_with_gmc(self, raw_pixel_mv, feat_target, feat_ref):
+        """
+        统一处理 MV 的 解耦(GMC) -> 局部精调(Refiner) -> 重组 流程
+        """
+        B, C, H, W = feat_target.shape
+        
+        # 1. 压缩回宏块级别给 CPU 算 RANSAC，极大提速
+        block_size = 16 
+        raw_mv_small = F.avg_pool2d(raw_pixel_mv, kernel_size=block_size, stride=block_size)
+        
+        # 2. 动态判断插值模式 (基于当前实例化的 refiner 类型)
+        # 如果名字里带有 'Convex'，说明是阵营 A，用 nearest 保留马赛克边缘
+        refiner_name = self.mv_refiner.__class__.__name__
+        interp_mode = 'nearest' if 'Convex' in refiner_name else 'bilinear'
+        
+        # 3. GMC 解耦：计算局部物体运动和全局背景光流
+        obj_motion, global_flow = self.gmc(
+            raw_mv_small, 
+            H, 
+            W, 
+            interpolation_mode=interp_mode
+        )
+        
+        # 4. Refiner 精调 (你的 refiner 接口完全统一，直接调即可)
+        # 此时 obj_motion 是剥离了背景运动的 [B, 2, H, W] 张量
+        if refiner_name in ['VanillaMVRefiner']:
+            refined_obj_motion = self.mv_refiner(obj_motion)
+        elif refiner_name in ['BasicMVRefiner', 'GatedMVRefiner', 'ConvexUpsamplingRefiner']:
+            refined_obj_motion = self.mv_refiner(obj_motion, feat_target)
+        else:
+            # 适配 ImageGuided, LiteImageGuided, LiteConvex
+            refined_obj_motion = self.mv_refiner(obj_motion, feat_target, feat_ref)
+        
+        # 5. 终极运动：将平滑的全局背景 与 精调后的局部细节 重新合并
+        final_mv = global_flow + refined_obj_motion
+        
+        return final_mv
+
+    def forward(self, imgs, mv_fwd, field_ids):
+        """
+        根据 self.training 自动切换 BPTT 展开 或 单步状态机推流
+        imgs:      [B, T, C, H, W]
+        flows_fwd: [B, T, 2, H, W]  # H.264 提取的前向参考 MV (本质是后向映射)
+        field_ids: [B, T]           # 顶/底场标识符
+        """
+        B, T, C, H, W = imgs.shape
+        
+        flags = field_ids.view(B, T, 1, 1, 1).expand(B, T, 1, H, W).float() 
+        inp = torch.cat([imgs, flags], dim=2)
+        feats = self.feat_extract(inp.view(-1, C + 1, H, W)).view(B, T, self.mid, H, W)
+
+        # =====================================================================
+        # 模式 A: 训练模式 (BPTT 展开计算 Loss) 
+        # =====================================================================
+        if self.training:
+            bwd_features = [None] * T
+            refined_mvs = [None] * T  
+            
+            # --- 1. 局部反向传播 ---
+            for t in range(T):
+                has_t1 = (t + 1 < T)
+                has_t2 = (t + 2 < T)
+
+                if not has_t1:
+                    bwd_features[t] = feats[:, t]
+                    continue
+                
+                if has_t2:
+                    # ✅ 物理偏移修改 1: 传入 t+2 和 t+1 的极性
+                    raw_mv_t1_ref_t2 = rescale_mv_temporal(
+                        quarterPixelMV_to_pixelMV(-mv_fwd[:, t+2]),
+                        src_oe=field_ids[:, t+2],
+                        tgt_oe=field_ids[:, t+1]
+                    )
+                    mv_t1_ref_t2 = self._refine_mv_with_gmc(raw_mv_t1_ref_t2, feats[:, t+1], feats[:, t+2])
+                    t1_warped_from_t2 = mv_warp(feats[:, t+2], mv_t1_ref_t2)
+                    hidden_state_t1 = self.h_prop_current_feat_fusion(t1_warped_from_t2, feats[:, t+1])
+                    hidden_state_t1 = self.backward_resblocks(hidden_state_t1) 
+                else:
+                    hidden_state_t1 = feats[:, t+1]
+                
+                # ✅ 物理偏移修改 2: 传入 t+1 和 t 的极性
+                raw_mv_t_ref_t1 = rescale_mv_temporal(
+                    quarterPixelMV_to_pixelMV(-mv_fwd[:, t+1]),
+                    src_oe=field_ids[:, t+1],
+                    tgt_oe=field_ids[:, t]
+                )
+                mv_t_ref_t1 = self._refine_mv_with_gmc(raw_mv_t_ref_t1, feats[:, t], feats[:, t+1])
+                t_order1_warped_bwd = mv_warp(hidden_state_t1, mv_t_ref_t1)
+                
+                if has_t2:
+                    # 二阶跳跃不需要 rescale 缩放时间，因此也不需要垂直修正
+                    raw_mv_t_ref_t2 = quarterPixelMV_to_pixelMV(-mv_fwd[:, t+2])
+                    mv_t_ref_t2 = self._refine_mv_with_gmc(raw_mv_t_ref_t2, feats[:, t], feats[:, t+2])
+                    t_order2_warped_bwd = mv_warp(feats[:, t+2], mv_t_ref_t2)
+                else:
+                    t_order2_warped_bwd = torch.zeros_like(t_order1_warped_bwd) 
+
+                fusion_order1and2_bwd = self.first_2nd_order_fusion(t_order1_warped_bwd, t_order2_warped_bwd)
+                h_bwd = self.h_prop_current_feat_fusion(fusion_order1and2_bwd, feats[:, t])
+                h_bwd_in = torch.cat([h_bwd, feats[:, t]], dim=1)
+                bwd_features[t] = self.backward_resblocks(h_bwd_in)
+
+            # --- 2. 前向传播与融合 ---
+            fwd_features = [None] * T
+            outs = [None] * T 
+            
+            for t in range(T):
+                has_tm1 = (t - 1 >= 0)
+                has_tm2 = (t - 2 >= 0)
+                
+                if has_tm1:
+                    # ✅ 物理偏移修改 3: 传入 t-1 和 t 的极性
+                    raw_mv_t_ref_tm1 = rescale_mv_temporal(
+                        quarterPixelMV_to_pixelMV(mv_fwd[:, t]),
+                        src_oe=field_ids[:, t-1],
+                        tgt_oe=field_ids[:, t]
+                    ) 
+                    mv_t_ref_tm1 = self._refine_mv_with_gmc(raw_mv_t_ref_tm1, feats[:, t], feats[:, t-1])
+                    t_order1_warped_fwd = mv_warp(fwd_features[t-1], mv_t_ref_tm1)
+                    
+                    refined_mvs[t] = mv_t_ref_tm1
+                else:
+                    t_order1_warped_fwd = torch.zeros_like(feats[:, t])
+                    refined_mvs[t] = torch.zeros(B, 2, H, W, device=imgs.device)
+                    
+                if has_tm2:
+                    raw_mv_t_ref_tm2 = quarterPixelMV_to_pixelMV(mv_fwd[:, t]) 
+                    mv_t_ref_tm2 = self._refine_mv_with_gmc(raw_mv_t_ref_tm2, feats[:, t], feats[:, t-2])
+                    t_order2_warped_fwd = mv_warp(fwd_features[t-2], mv_t_ref_tm2)
+                else:
+                    t_order2_warped_fwd = torch.zeros_like(feats[:, t])
+
+                if has_tm1 or has_tm2:
+                    fusion_order1and2_fwd = self.first_2nd_order_fusion(t_order1_warped_fwd, t_order2_warped_fwd)
+                    h_fwd = self.h_prop_current_feat_fusion(fusion_order1and2_fwd, feats[:, t])
+                else:
+                    h_fwd = feats[:, t]
+
+                bidirect_feat = torch.cat([h_fwd, bwd_features[t], feats[:, t]], dim=1)
+                h_fwd = self.forward_resblocks(bidirect_feat)
+                fwd_features[t] = h_fwd
+
+            # --- 3. 晚期融合与重建 ---
+            for t in range(T):
+                final_feat = fwd_features[t]           
+                current_o_e = field_ids[:, t] if field_ids is not None else t % 2
+                up_feat = self.deint_up(final_feat, o_e=current_o_e)
+                hr_feat = self.refinement(up_feat)
+                out_residual = self.last_conv(hr_feat)
+                curr_field = imgs[:, t] 
+                base_frame = F.interpolate(curr_field, scale_factor=(2, 1), mode='bilinear', align_corners=False)
+                
+                outs[t] = out_residual + base_frame
+
+            sr_out = torch.stack(outs, dim=1) 
+            all_mvs = torch.stack(refined_mvs, dim=1)
+            
+            return {
+                'sr': sr_out,
+                'flows': all_mvs,   
+                'lr_imgs': imgs     
+            }
+
+        # =====================================================================
+        # 模式 B: 推理模式 (实时推流状态机)
+        # =====================================================================
+        else:
+            with torch.no_grad():
+                bwd_features = [None] * T
+                fwd_features = [None] * T
+                outs = [None] * T
+                
+                if self.h_fwd_cache is None:
+                    h_tm1, h_tm2, feat_tm1, feat_tm2 = None, None, None, None
+                else:
+                    h_tm1, h_tm2, feat_tm1, feat_tm2 = self.h_fwd_cache
+
+                # --- 1. 推理态反向 Lookahead ---
+                for t in range(T):
+                    has_t1 = (t + 1 < T)
+                    has_t2 = (t + 2 < T)
+                    
+                    if not has_t1:
+                        bwd_features[t] = feats[:, t]
+                        continue
+                        
+                    if has_t2:
+                        # ✅ 推理态物理偏移修改 1: 传入 t+2 和 t+1 的极性
+                        raw_mv_t1_ref_t2 = rescale_mv_temporal(
+                            quarterPixelMV_to_pixelMV(-mv_fwd[:, t+2]),
+                            src_oe=field_ids[:, t+2] if field_ids is not None else (t+2)%2,
+                            tgt_oe=field_ids[:, t+1] if field_ids is not None else (t+1)%2
+                        )
+                        mv_t1_ref_t2 = self._refine_mv_with_gmc(raw_mv_t1_ref_t2, feats[:, t+1], feats[:, t+2])
+                        t1_warped_from_t2 = mv_warp(feats[:, t+2], mv_t1_ref_t2)
+                        hidden_state_t1 = self.h_prop_current_feat_fusion(t1_warped_from_t2, feats[:, t+1])
+                        hidden_state_t1 = self.backward_resblocks(hidden_state_t1) 
+                    else:
+                        hidden_state_t1 = feats[:, t+1]
+                    
+                    # ✅ 推理态物理偏移修改 2: 传入 t+1 和 t 的极性
+                    raw_mv_t_ref_t1 = rescale_mv_temporal(
+                        quarterPixelMV_to_pixelMV(-mv_fwd[:, t+1]),
+                        src_oe=field_ids[:, t+1] if field_ids is not None else (t+1)%2,
+                        tgt_oe=field_ids[:, t] if field_ids is not None else t%2
+                    )
+                    mv_t_ref_t1 = self._refine_mv_with_gmc(raw_mv_t_ref_t1, feats[:, t], feats[:, t+1])
+                    t_order1_warped_bwd = mv_warp(hidden_state_t1, mv_t_ref_t1)
+                    
+                    if has_t2:
+                        raw_mv_t_ref_t2 = quarterPixelMV_to_pixelMV(-mv_fwd[:, t+2])
+                        mv_t_ref_t2 = self._refine_mv_with_gmc(raw_mv_t_ref_t2, feats[:, t], feats[:, t+2])
+                        t_order2_warped_bwd = mv_warp(feats[:, t+2], mv_t_ref_t2)
+                    else:
+                        t_order2_warped_bwd = torch.zeros_like(t_order1_warped_bwd) 
+
+                    fusion_order1and2_bwd = self.first_2nd_order_fusion(t_order1_warped_bwd, t_order2_warped_bwd)
+                    h_bwd = self.h_prop_current_feat_fusion(fusion_order1and2_bwd, feats[:, t])
+                    h_bwd_in = torch.cat([h_bwd, feats[:, t]], dim=1)
+                    bwd_features[t] = self.backward_resblocks(h_bwd_in)
+
+                # --- 2. 推理态前向传播与缓存更新 ---
+                for t in range(T):
+                    ref_feat_1 = feats[:, t-1] if t > 0 else feat_tm1
+                    ref_feat_2 = feats[:, t-2] if t > 1 else (feat_tm1 if t == 1 else feat_tm2)
+                    
+                    if h_tm1 is not None and ref_feat_1 is not None:
+                        # ✅ 推理态物理偏移修改 3: 结合历史状态的安全极性推断
+                        current_oe = field_ids[:, t] if field_ids is not None else t%2
+                        prev_oe = field_ids[:, t-1] if (t-1 >= 0 and field_ids is not None) else (t-1)%2
+                        
+                        raw_mv_t_ref_tm1 = rescale_mv_temporal(
+                            quarterPixelMV_to_pixelMV(mv_fwd[:, t]),
+                            src_oe=prev_oe,
+                            tgt_oe=current_oe
+                        ) 
+                        mv_t_ref_tm1 = self._refine_mv_with_gmc(raw_mv_t_ref_tm1, feats[:, t], ref_feat_1)
+                        t_order1_warped_fwd = mv_warp(h_tm1, mv_t_ref_tm1)
+                    else:
+                        t_order1_warped_fwd = torch.zeros_like(feats[:, t])
+                        
+                    if h_tm2 is not None and ref_feat_2 is not None:
+                        raw_mv_t_ref_tm2 = quarterPixelMV_to_pixelMV(mv_fwd[:, t]) 
+                        mv_t_ref_tm2 = self._refine_mv_with_gmc(raw_mv_t_ref_tm2, feats[:, t], ref_feat_2)
+                        t_order2_warped_fwd = mv_warp(h_tm2, mv_t_ref_tm2)
+                    else:
+                        t_order2_warped_fwd = torch.zeros_like(feats[:, t])
+
+                    if h_tm1 is not None or h_tm2 is not None:
+                        fusion_order1and2_fwd = self.first_2nd_order_fusion(t_order1_warped_fwd, t_order2_warped_fwd)
+                        h_fwd = self.h_prop_current_feat_fusion(fusion_order1and2_fwd, feats[:, t])
+                    else:
+                        h_fwd = feats[:, t]
+
+                    bidirect_feat = torch.cat([h_fwd, bwd_features[t], feats[:, t]], dim=1)
+                    h_fwd = self.forward_resblocks(bidirect_feat)
+                    fwd_features[t] = h_fwd
+
+                    h_tm2 = h_tm1
+                    h_tm1 = h_fwd.detach()
+                    feat_tm2 = feat_tm1
+                    feat_tm1 = feats[:, t].detach()
+
+                self.h_fwd_cache = (h_tm1, h_tm2, feat_tm1, feat_tm2)
+
+                # --- 3. 推理态重建 ---
+                for t in range(T):
+                    final_feat = fwd_features[t]           
+                    current_o_e = field_ids[:, t] if field_ids is not None else t % 2
+                    up_feat = self.deint_up(final_feat, o_e=current_o_e)
+                    hr_feat = self.refinement(up_feat)
+                    out_residual = self.last_conv(hr_feat)
+                    curr_field = imgs[:, t] 
+                    base_frame = F.interpolate(curr_field, scale_factor=(2, 1), mode='bilinear', align_corners=False)
+                    
+                    outs[t] = out_residual + base_frame
+                    
+                return torch.stack(outs, dim=1)
+==================================================
+FILE: ./motionVectorDeinterlacing/models/components/mvRefiners.py
+==================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from motionVectorDeinterlacing.models.registry import COMPONENT_REGISTRY
+from .blocks import ResidualBlock, build_activation
+from motionVectorDeinterlacing.utils.ops import mv_warp # 1. 修正导入
+
+# --- 0. 极简零初始化版 (Vanilla) ---
+@COMPONENT_REGISTRY.register('VanillaMVRefiner')
+class VanillaMVRefiner(nn.Module):
+    def __init__(self, in_channels=2, mid_channels=32, act_cfg="ReLU"):
+        super().__init__()
+        # 工业化打包，极简的 ReLU 激活
+        self.body = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, 3, 1, 1),
+            build_activation(act_cfg), 
+            nn.Conv2d(mid_channels, 2, 3, 1, 1)
+        )
+        
+        # 零初始化
+        nn.init.zeros_(self.body[-1].weight)
+        nn.init.zeros_(self.body[-1].bias)
+
+    def forward(self, mv):
+        # 极其清爽的残差相加
+        return mv + self.body(mv)
+
+# --- 1. 基础版：轻量级残差修正 ---
+@COMPONENT_REGISTRY.register('BasicMVRefiner')
+class BasicMVRefiner(nn.Module):
+    def __init__(self, in_channels=2, feat_channels=64, mid_channels=32, act_cfg="PReLU"):
+        super().__init__()
+        # 工业化改造：打包成 body
+        self.body = nn.Sequential(
+            nn.Conv2d(in_channels + feat_channels, mid_channels, 3, 1, 1),
+            build_activation(act_cfg),
+            nn.Conv2d(mid_channels, 2, 3, 1, 1)
+        )
+
+        nn.init.zeros_(self.body[-1].weight)
+        nn.init.zeros_(self.body[-1].bias)
+
+    def forward(self, mv, feat):
+        cat_in = torch.cat([mv, feat], dim=1)
+        return mv + self.body(cat_in)
+
+# --- 2. 凸上采样版 (Convex Upsampling)：针对 16x16 宏块的 1/4 优化版 ---
+@COMPONENT_REGISTRY.register('ConvexUpsamplingRefiner')
+class ConvexUpsamplingRefiner(nn.Module):
+    def __init__(self, feat_channels=64, up_factor=4, act_cfg="PReLU"):
+        super().__init__()
+        self.up_factor = up_factor
+        self.kernel_size = 3
+        # 预测 4x4 区域内每个像素的 9 个权重
+        out_channels = (up_factor ** 2) * (self.kernel_size ** 2)
+        
+        self.mask_predictor = nn.Sequential(
+            nn.Conv2d(feat_channels, 64, 3, 1, 1),
+            build_activation(act_cfg),
+            nn.Conv2d(64, out_channels, 1)
+        )
+
+        # 在 ConvexUpsamplingRefiner 的 __init__ 最后加上：
+        nn.init.zeros_(self.mask_predictor[-1].weight)
+        nn.init.zeros_(self.mask_predictor[-1].bias)
+
+    def forward(self, mv, feat):
+        """
+        mv: (B, 2, H, W) 
+        feat: (B, C, H/4, W/4) 
+        """
+        B, C, H, W = mv.shape
+        H_lr, W_lr = H // self.up_factor, W // self.up_factor
+
+        lr_mv = F.avg_pool2d(mv, kernel_size=self.up_factor)
+        
+        mask = self.mask_predictor(feat)
+        mask = mask.view(B, 1, self.up_factor**2, self.kernel_size**2, H_lr, W_lr)
+        mask = F.softmax(mask, dim=3)
+        
+        mv_padded = F.pad(lr_mv, (1, 1, 1, 1), mode='replicate')
+        mv_unfolded = F.unfold(mv_padded, kernel_size=3).view(B, 2, 1, 9, H_lr, W_lr)
+        
+        out = torch.sum(mask * mv_unfolded, dim=3) # (B, 2, 16, H_lr, W_lr)
+        out = out.view(B, 2, self.up_factor, self.up_factor, H_lr, W_lr)
+        out = out.permute(0, 1, 4, 2, 5, 3).contiguous()
+        return out.view(B, 2, H, W)
+
+# --- 3. 门控残差版 (Gated Refiner) ---
+@COMPONENT_REGISTRY.register('GatedMVRefiner')
+class GatedMVRefiner(nn.Module):
+    def __init__(self, feat_channels=64, mid_channels=64, act_cfg="PReLU"):
+        super().__init__()
+        self.mv_res_conv = nn.Sequential(
+            nn.Conv2d(feat_channels + 2, mid_channels, 3, 1, 1),
+            build_activation(act_cfg),
+            nn.Conv2d(mid_channels, 2, 3, 1, 1)
+        )
+        self.gate_conv = nn.Sequential(
+            nn.Conv2d(feat_channels + 2, mid_channels, 3, 1, 1),
+            build_activation(act_cfg),
+            nn.Conv2d(mid_channels, 1, 3, 1, 1),
+            nn.Sigmoid()
+        )
+        nn.init.zeros_(self.mv_res_conv[-1].weight)
+        nn.init.zeros_(self.mv_res_conv[-1].bias)
+
+    def forward(self, mv, feat):
+        cat_in = torch.cat([mv, feat], dim=1)
+        return mv + self.gate_conv(cat_in) * self.mv_res_conv(cat_in)
+
+# --- 4. 图像引导版 (ImageGuided - 接口统一版) ---
+
+@COMPONENT_REGISTRY.register('ImageGuidedMVRefiner')
+class ImageGuidedMVRefiner(nn.Module):
+    def __init__(self, mid=64, act_cfg="PReLU"):
+        super().__init__()
+     
+        self.fusion = nn.Conv2d(2 + mid * 2, mid, 3, 1, 1)
+        self.body = nn.Sequential(
+            *[ResidualBlock(mid, act_cfg=act_cfg) for _ in range(4)]
+        )
+        self.mask_predictor = nn.Sequential(
+            nn.Conv2d(mid * 2, mid, 3, 1, 1),
+            build_activation(act_cfg),
+            nn.Conv2d(mid, 1, 3, 1, 1),
+            nn.Sigmoid()
+        )
+        self.out_conv = nn.Conv2d(mid, 2, 3, 1, 1)
+        nn.init.zeros_(self.out_conv.weight)
+        nn.init.zeros_(self.out_conv.bias)
+
+    def forward(self, raw_mv, curr_feat, ref_feat):
+        warped_ref_feat = mv_warp(ref_feat, raw_mv)
+        diff_feat = curr_feat - warped_ref_feat
+        occ_mask = self.mask_predictor(torch.cat([curr_feat, warped_ref_feat], dim=1)) # 输出 Sigmoid
+        masked_diff = diff_feat * occ_mask
+        inp = torch.cat([raw_mv, curr_feat, masked_diff], dim=1)
+        
+        x = self.body(self.fusion(inp))
+        delta_mv = self.out_conv(x) * 0.1 
+        return raw_mv + delta_mv
+
+# --- 5. 瘦身实时版 (LiteImageGuided - 步长卷积/接口统一版) ---
+@COMPONENT_REGISTRY.register('LiteImageGuidedMVRefiner')
+class LiteImageGuidedMVRefiner(nn.Module):
+    def __init__(self, mid=64, up_factor=4, act_cfg="PReLU"):
+        super().__init__()
+        self.up_factor = up_factor
+ 
+        
+        # 使用步长卷积进行下采样，相比 Pooling 更有学习能力
+        self.downsample_mv = nn.Conv2d(2, 2, kernel_size=up_factor, stride=up_factor, padding=0)
+        
+        self.fusion = nn.Conv2d(2 + mid * 2, mid, 3, 1, 1)
+        self.body = nn.Sequential(
+            ResidualBlock(mid, act_cfg=act_cfg),
+            ResidualBlock(mid, act_cfg=act_cfg)
+        )
+        # 接口统一：只输出 2 通道
+        self.out_conv = nn.Conv2d(mid, 2, 3, 1, 1)
+        nn.init.zeros_(self.out_conv.weight)
+        nn.init.zeros_(self.out_conv.bias)
+
+    def forward(self, raw_mv, curr_feat, ref_feat):
+        # --- 新增：对输入的高维特征进行下采样，对齐低分辨率空间 ---
+        lr_curr_feat = F.avg_pool2d(curr_feat, self.up_factor)
+        lr_ref_feat = F.avg_pool2d(ref_feat, self.up_factor)
+
+        # 1. 步长卷积下采样 MV
+        lr_mv = self.downsample_mv(raw_mv)
+        
+        # 2. 低分辨率对齐与误差计算 (全部使用 lr_ 级别的张量)
+        warped_ref_feat = mv_warp(lr_ref_feat, lr_mv)
+        diff_feat = lr_curr_feat - warped_ref_feat
+        
+        # 3. 融合与残差预测 (拼接 lr_ 级别的张量)
+        inp = torch.cat([lr_mv, lr_curr_feat, diff_feat], dim=1)
+        x = self.body(self.fusion(inp))
+        
+        # 4. 残差缩放并放大
+        lr_delta = self.out_conv(x) * 0.1
+        delta_mv = F.interpolate(lr_delta, scale_factor=self.up_factor, mode='bilinear', align_corners=False)
+        
+        return raw_mv + delta_mv
+    
+# --- 6. 终极实时版 (Lite + Convex Upsampling 融合版) ---
+@COMPONENT_REGISTRY.register('LiteConvexMVRefiner')
+class LiteConvexMVRefiner(nn.Module):
+    def __init__(self, mid=64, up_factor=4, act_cfg="PReLU"):
+        super().__init__()
+        self.up_factor = up_factor
+        self.kernel_size = 3
+      
+        
+        # 1. 步长卷积下采样 MV (代替 pooling)
+        self.downsample_mv = nn.Conv2d(2, 2, kernel_size=up_factor, stride=up_factor)
+        
+        # 2. 轻量级特征与误差融合 (1/4 分辨率下运行)
+        self.fusion = nn.Conv2d(2 + mid * 2, mid, 3, 1, 1)
+        self.body = nn.Sequential(
+            ResidualBlock(mid, act_cfg=act_cfg),
+            ResidualBlock(mid, act_cfg=act_cfg)
+        )
+        
+        # 3. 计算低分辨率的 MV 修正量
+        self.res_conv = nn.Conv2d(mid, 2, 3, 1, 1)
+        nn.init.zeros_(self.res_conv.weight)
+        nn.init.zeros_(self.res_conv.bias)
+
+        # 4. 凸上采样权重预测器 (Convex Mask Predictor)
+        # 注意：这里直接吃 body 提好的 mid 通道特征，避免重复计算！
+        out_channels = (up_factor ** 2) * (self.kernel_size ** 2)
+        self.mask_predictor = nn.Sequential(
+            nn.Conv2d(mid, 64, 3, 1, 1),
+            build_activation(act_cfg),
+            nn.Conv2d(64, out_channels, 1)
+        )
+        nn.init.zeros_(self.mask_predictor[-1].weight)
+        nn.init.zeros_(self.mask_predictor[-1].bias)
+
+    def forward(self, raw_mv, curr_feat, ref_feat):
+        B, _, H, W = raw_mv.shape
+        H_lr, W_lr = H // self.up_factor, W // self.up_factor
+        lr_curr_feat = F.avg_pool2d(curr_feat, self.up_factor)
+        lr_ref_feat = F.avg_pool2d(ref_feat, self.up_factor)
+
+        # --- 第一阶段：低分辨率极速计算 (耗时极低) ---
+        lr_mv = self.downsample_mv(raw_mv)
+        
+        # Warp & 计算误差图
+        warped_ref_feat = mv_warp(lr_ref_feat, lr_mv)
+        diff_feat = lr_curr_feat - warped_ref_feat
+        
+        # 提取融合特征 x
+        inp = torch.cat([lr_mv, lr_curr_feat, diff_feat], dim=1)
+        x = self.body(self.fusion(inp))
+        
+        # 算出低清修正量，并得到修正后的低清 MV
+        lr_delta = self.res_conv(x) * 0.1
+        refined_lr_mv = lr_mv + lr_delta
+
+        # --- 第二阶段：凸组合上采样恢复至全尺寸 ---
+        # 1. 用特征 x 预测 9 个邻居的放大权重
+        mask = self.mask_predictor(x)
+        mask = mask.view(B, 1, self.up_factor**2, self.kernel_size**2, H_lr, W_lr)
+        mask = F.softmax(mask, dim=3)
+        
+        # 2. 提取 3x3 邻居
+        mv_padded = F.pad(refined_lr_mv, (1, 1, 1, 1), mode='replicate')
+        mv_unfolded = F.unfold(mv_padded, kernel_size=3).view(B, 2, 1, 9, H_lr, W_lr)
+        
+        # 3. 加权求和并用 Pixel Shuffle 思想铺平
+        out = torch.sum(mask * mv_unfolded, dim=3)
+        out = out.view(B, 2, self.up_factor, self.up_factor, H_lr, W_lr)
+        out = out.permute(0, 1, 4, 2, 5, 3).contiguous()
+        
+        return out.view(B, 2, H, W)
+==================================================
+FILE: ./motionVectorDeinterlacing/models/components/__init__.py
+==================================================
+from .activation import build_activation
+from .blocks import StandardResidualBlock, ChannelAttentionBlock, RepConv, DeintShufflePack
+from .fusion import MotionAdaptiveFusion, BasicConcatFusion, SoftGateAdaptiveFusion, DeinterlacingMultiOrderFusion, SimpleAverageFusion
+from .mvRefiners import VanillaMVRefiner, BasicMVRefiner, ConvexUpsamplingRefiner, GatedMVRefiner, ImageGuidedMVRefiner, LiteImageGuidedMVRefiner, LiteConvexMVRefiner
+==================================================
+FILE: ./motionVectorDeinterlacing/models/components/activation.py
+==================================================
+import torch.nn as nn
+from ..registry import ACTIVATION_REGISTRY, build_from_cfg
+
+# --- 1. 注册 PyTorch 原生激活函数 ---
+# 这样你就能在 YAML 里直接写 "ReLU" 或 "LeakyReLU" 了
+ACTIVATION_REGISTRY.register('ReLU')(nn.ReLU)
+ACTIVATION_REGISTRY.register('LeakyReLU')(nn.LeakyReLU)
+ACTIVATION_REGISTRY.register('PReLU')(nn.PReLU)
+ACTIVATION_REGISTRY.register('Sigmoid')(nn.Sigmoid)
+ACTIVATION_REGISTRY.register('Tanh')(nn.Tanh)
+ACTIVATION_REGISTRY.register('Identity')(nn.Identity)
+
+# --- 2. 编写全局构建助手函数 ---
+def build_activation(cfg):
+    """
+    一个更加健壮的构建函数，适应你的 Pydantic 配置逻辑
+    cfg 可能是: "PReLU" 或 {"type": "LeakyReLU", "negative_slope": 0.1}
+    """
+    if cfg is None:
+        return nn.Identity()
+    
+    # 利用你之前写好的 build_from_cfg
+    return build_from_cfg(cfg, ACTIVATION_REGISTRY)
+==================================================
+FILE: ./motionVectorDeinterlacing/models/components/fusion.py
+==================================================
+import torch
+import torch.nn as nn
+from motionVectorDeinterlacing.models.registry import COMPONENT_REGISTRY
+from motionVectorDeinterlacing.models.components.activation import build_activation  
+
+#There are three stage which need fusion:
+# 1. fusion of 1-order and 2-order motion features (MultiOrderFusion)
+# 2. fusion of current frame feature and warped reference feature (MotionAdaptiveFusion)
+# 3. fusion of forward and backward propagated features (BasicConcatFusion)
+# ==========================================
+# 1. 高级版：动静自适应融合 (用于时域传播) 
+# /fusion of current frame feature and h_prop
+# ==========================================
+@COMPONENT_REGISTRY.register('MotionAdaptiveFusion')
+class MotionAdaptiveFusion(nn.Module):
+    """
+    带“大脑”的动静自适应融合模块 (Soft Bob/Weave)
+    """
+    def __init__(self, c_in=64, act_cfg=dict(type='LeakyReLU', negative_slope=0.1)):
+        super().__init__()
+        self.mask_predictor = nn.Sequential(
+            nn.Conv2d(c_in * 2, c_in, 3, 1, 1),
+            build_activation(act_cfg), 
+            nn.Conv2d(c_in, 1, 3, 1, 1),
+            nn.Sigmoid() 
+        )
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(c_in * 2, c_in, 3, 1, 1),
+            build_activation(act_cfg)  
+        )
+
+    def _init_special_weights(self):
+        """专属覆盖逻辑：只修改最后一层的输出分布，保护 Sigmoid/Softmax"""
+        nn.init.normal_(self.mask_predictor[-2].weight, mean=0, std=0.01)
+        nn.init.constant_(self.mask_predictor[-2].bias, 0)
+
+    def forward(self, curr_feat, h_prop):
+        cat_feat = torch.cat([curr_feat, h_prop], dim=1)
+        mask = self.mask_predictor(cat_feat)
+        filtered_h_prop = h_prop * mask
+        out_feat = self.fusion_conv(torch.cat([curr_feat, filtered_h_prop], dim=1))
+        return out_feat, mask 
+
+
+# ==========================================
+# 2. 经典版：基础拼接融合 (用于双向末端合并)
+# /fusion of forward and backward propagated features/h_prop and current feature fusion
+# ==========================================
+@COMPONENT_REGISTRY.register('BasicConcatFusion')
+class BasicConcatFusion(nn.Module):
+    """
+    老代码中的 1x1 拼接融合，简单粗暴且有效
+    """
+    def __init__(self, c_in=64):
+        super().__init__()
+        self.fusion = nn.Conv2d(c_in * 2, c_in, 1, 1)
+
+    def forward(self, fwd_feat, bwd_feat):
+        return self.fusion(torch.cat([fwd_feat, bwd_feat], dim=1))
+
+
+# ==========================================
+# 3. SoftGate 动静融合 (用于时域传播)/fusion of current frame feature and h_prop
+# ==========================================
+@COMPONENT_REGISTRY.register('SoftGateAdaptiveFusion')
+class SoftGateAdaptiveFusion(nn.Module):
+    """
+    轻量级动静自适应融合模块 (基于简化版 ConvGRU 更新门机制)
+    """
+    def __init__(self, mid=64):
+        super().__init__()
+        self.mask_conv = nn.Sequential(
+            nn.Conv2d(mid * 2, mid, 3, 1, 1),
+            nn.Sigmoid() 
+        )
+
+    def _init_special_weights(self):
+        """专属覆盖逻辑：只修改最后一层的输出分布，保护 Sigmoid/Softmax"""
+        nn.init.normal_(self.mask_conv[-2].weight, mean=0, std=0.01)
+        nn.init.constant_(self.mask_conv[-2].bias, 0)
+
+    def forward(self, curr_feat, h_prop):
+        cat_feat = torch.cat([curr_feat, h_prop], dim=1)
+        mask = self.mask_conv(cat_feat)
+        fused_feat = mask * h_prop + (1.0 - mask) * curr_feat
+        return fused_feat, mask
+    
+
+# ==========================================
+# 4. Multi-Order Fusion (用于一阶和二阶传播融合) /fusion of 1-order and 2-order motion features
+# ==========================================
+
+@COMPONENT_REGISTRY.register('DeinterlacingMultiOrderFusion')
+class DeinterlacingMultiOrderFusion(nn.Module):
+    def __init__(self, mid_channels=64): 
+        super().__init__()
+        # 接收三个特征：curr_feat(标准答案), h1_warped(一阶草稿), h2_warped(二阶草稿)
+        self.attention_net = nn.Sequential(
+            nn.Conv2d(mid_channels * 3, mid_channels, 3, 1, 1),
+            nn.LeakyReLU(0.1, True),
+            # 输出 3 个权重通道！
+            nn.Conv2d(mid_channels, 3, 3, 1, 1) 
+        )
+    
+    def _init_special_weights(self):
+        """专属覆盖逻辑：只修改最后一层的输出分布，保护 Sigmoid/Softmax"""
+        nn.init.normal_(self.attention_net[-1].weight, mean=0, std=0.01)
+        nn.init.constant_(self.attention_net[-1].bias, 0)
+
+    def forward(self, curr_feat, h1_warped, h2_warped):
+        # 1. 把标准答案和两份草稿摆在一起对质
+        cat_feat = torch.cat([curr_feat, h1_warped, h2_warped], dim=1)
+        
+        # 2. 算出 3 份权重
+        weight_logits = self.attention_net(cat_feat)
+        weights = torch.softmax(weight_logits, dim=1)
+        
+        w_curr = weights[:, 0:1, :, :] 
+        w_h1   = weights[:, 1:2, :, :] 
+        w_h2   = weights[:, 2:3, :, :] 
+        
+        # 3. 终极融合：带“止损机制”的 Alpha Blending
+        h_prop = (curr_feat * w_curr) + (h1_warped * w_h1) + (h2_warped * w_h2)
+        
+        return h_prop, w_curr, w_h1, w_h2
+
+
+# ==========================================
+# 5. Baseline: 简单平均一阶二阶融合 (消融实验用) /fusion of 1-order and 2-order motion features
+# ==========================================
+@COMPONENT_REGISTRY.register('SimpleAverageFusion')
+class SimpleAverageFusion(nn.Module):
+    """
+    最原始的做法：无视特征质量，强行把一阶和二阶相加后除以 2
+    """
+    def __init__(self, **kwargs):
+        super().__init__()
+
+    def forward(self, h1_warped, h2_warped):
+        h_prop = (h1_warped + h2_warped) * 0.5
+        # 返回虚拟权重对齐接口
+        B, _, H, W = h1_warped.shape
+        w1 = torch.full((B, 1, H, W), 0.5, device=h1_warped.device)
+        w2 = torch.full((B, 1, H, W), 0.5, device=h1_warped.device)
+        return h_prop, w1, w2
+
+
+
+==================================================
+FILE: ./motionVectorDeinterlacing/models/components/blocks.py
+==================================================
+import torch
+import torch.nn as nn
+from ..registry import COMPONENT_REGISTRY
+# 必须导入你定义的助手函数
+from .activation import build_activation 
+from motionVectorDeinterlacing.utils.ops import default_init_weights
+
+# ==========================================
+# 选项 A: 标准残差块 (StandardResidualBlock)
+# 特点：快，PC GPU 兼容性最好
+# ==========================================
+@COMPONENT_REGISTRY.register('StandardResidualBlock')
+class StandardResidualBlock(nn.Module):
+    def __init__(self, nf, act_cfg="PReLU", res_scale=0.1):
+        super().__init__()
+        self.res_scale = res_scale
+        self.body = nn.Sequential(
+            nn.Conv2d(nf, nf, 3, 1, 1),
+            build_activation(act_cfg),
+            nn.Conv2d(nf, nf, 3, 1, 1)
+        )
+        nn.init.zeros_(self.body[2].weight)
+        nn.init.zeros_(self.body[2].bias)
+    def forward(self, x):
+        # 使用残差缩放 λ=0.1
+        return x + self.body(x) * self.res_scale
+
+# ==========================================
+# 选项 B: 通道注意力残差块 (RCAB)
+# 特点：画质上限更高，能自动学会哪些通道对去交错更重要
+# ==========================================
+@COMPONENT_REGISTRY.register('ChannelAttentionBlock')
+class ChannelAttentionBlock(nn.Module):
+    def __init__(self, nf, act_cfg="PReLU", res_scale=0.1, reduction=16, deploy=False):
+        super().__init__()
+        self.res_scale = res_scale
+        self.conv_layers = nn.Sequential(
+            RepConv(nf, nf, deploy=deploy),
+            build_activation(act_cfg),
+            nn.Conv2d(nf, nf, 3, 1, 1)
+        )
+        
+        # 极轻量的通道注意力 (Squeeze-and-Excitation)
+        self.ca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(nf, nf // reduction, 1, padding=0),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(nf // reduction, nf, 1, padding=0),
+            nn.Sigmoid()
+        )
+        # 1. 主分支零初始化 (保证初始输出为 0)
+        nn.init.zeros_(self.conv_layers[-1].weight)
+        nn.init.zeros_(self.conv_layers[-1].bias)
+        
+        # 2. 注意力分支零初始化 (保证初始权重为 Sigmoid(0) = 0.5)
+        nn.init.zeros_(self.ca[-2].weight)
+        nn.init.zeros_(self.ca[-2].bias)
+
+    def forward(self, x):
+        res = self.conv_layers(x)
+        attn = self.ca(res)
+        return x + (res * attn) * self.res_scale
+
+
+class RepConv(nn.Module):
+    """底层视觉专用的无 BN 重参数化卷积"""
+    def __init__(self, in_channels, out_channels, deploy=False):
+        super().__init__()
+        self.deploy = deploy
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        # --- 部署模式 (极简) ---
+        if self.deploy:
+            self.rbr_reparam = nn.Conv2d(in_channels, out_channels, 3, 1, 1, bias=True)
+        # --- 训练模式 (多分支) ---
+        else:
+            # 分支 1：标准 3x3 卷积 (带偏置)
+            self.rbr_dense = nn.Conv2d(in_channels, out_channels, 3, 1, 1, bias=True)
+            # 分支 2：1x1 卷积 (不带偏置，因为分支 1 已经有了)
+            self.rbr_1x1 = nn.Conv2d(in_channels, out_channels, 1, 1, 0, bias=False)
+            # 分支 3：恒等映射 (仅当输入输出通道一致时存在)
+            self.rbr_identity = nn.Identity() if out_channels == in_channels else None
+
+    def forward(self, x):
+        if self.deploy:
+            return self.rbr_reparam(x) # 部署时，只有一层 3x3，极速！
+        
+        # 训练时，三路特征相加，感受野无敌
+        out = self.rbr_dense(x) + self.rbr_1x1(x)
+        if self.rbr_identity is not None:
+            out += self.rbr_identity(x)
+        return out
+
+    def switch_to_deploy(self):
+        """核心魔法：训练完成后，调用此函数将多分支融合成一个 3x3 卷积"""
+        if self.deploy:
+            return
+        
+        # 1. 获取 3x3 的权重和偏置
+        weight_3x3 = self.rbr_dense.weight.data
+        bias_3x3 = self.rbr_dense.bias.data
+        
+        # 2. 获取 1x1 的权重，并用 0 填充成 3x3 的形状
+        weight_1x1 = self.rbr_1x1.weight.data
+        weight_1x1_padded = F.pad(weight_1x1, [1, 1, 1, 1])
+        
+        # 3. 构造恒等映射的 3x3 权重 (中心点为 1，其余为 0)
+        weight_id = torch.zeros_like(weight_3x3)
+        if self.rbr_identity is not None:
+            for i in range(self.in_channels):
+                weight_id[i, i, 1, 1] = 1.0
+
+        # 4. 矩阵加法：融合成最终的单层权重！
+        fused_weight = weight_3x3 + weight_1x1_padded + weight_id
+        fused_bias = bias_3x3 # 1x1和id分支没有偏置
+        
+        # 5. 替换为部署用的卷积层
+        self.rbr_reparam = nn.Conv2d(self.in_channels, self.out_channels, 3, 1, 1, bias=True)
+        self.rbr_reparam.weight.data = fused_weight
+        self.rbr_reparam.bias.data = fused_bias
+        
+        # 6. 删掉训练时的臃肿分支，释放内存
+        self.__delattr__('rbr_dense')
+        self.__delattr__('rbr_1x1')
+        self.__delattr__('rbr_identity')
+        self.deploy = True
+
+import torch
+import torch.nn as nn
+# 假设你在这个文件里引入了 default_init_weights 和注册表
+# from ..utils.ops import default_init_weights 
+# from ..registry import COMPONENT_REGISTRY
+
+@COMPONENT_REGISTRY.register('DeintShufflePack') # 如果你需要注册它
+class DeintShufflePack(nn.Module):
+    """Pixel Shuffle upsample layer with Deinterlacing support (Optimized Version)."""
+ 
+    def __init__(self, in_channels, out_channels, scale_factor=2,
+                 upsample_kernel=3, mode: int=1):
+        super().__init__()
+        # 加入防呆设计：Deinterlacing 只能做垂直 2 倍放大
+        assert scale_factor == 2, "DeintShufflePack only supports scale_factor=2!"
+        
+        self.mode = mode
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.scale_factor = scale_factor
+        self.upsample_kernel = upsample_kernel
+
+        self.upsample_conv = nn.Conv2d(
+            self.in_channels,
+            self.out_channels * scale_factor,
+            self.upsample_kernel,
+            padding=(self.upsample_kernel - 1) // 2)
+        
+        self.init_weights()
+ 
+    def init_weights(self):
+        # 绝不忘掉我们之前讨论过的初始化铁律！
+        default_init_weights(self, 1)
+ 
+    def forward(self, x, o_e):
+        x = self.upsample_conv(x)
+ 
+        B, C, H, W = x.shape
+        C2 = C // 2
+        H2 = H * 2 
+
+        # 1. 极其关键：将 mask 转为 bool 型！布尔索引在 CUDA 底层速度最快
+        if isinstance(o_e, torch.Tensor):
+            mask_odd = o_e.view(B, 1, 1, 1).bool()
+        else:
+            mask_odd = torch.tensor(o_e, device=x.device, dtype=torch.bool).view(B, 1, 1, 1)
+
+        if self.mode == 1:
+            # 拿到两把拉链齿（不增加任何显存，这只是 View）
+            x1 = x[:, :C2, :, :]
+            x2 = x[:, C2:, :, :]
+            
+            # 2. 神级优化：使用 torch.where 玩转“零和博弈”
+            # torch.where(condition, true_tensor, false_tensor)
+            # 如果是奇数场 (mask_odd=True)：x2 在上，x1 在下
+            # 如果是偶数场 (mask_odd=False)：x1 在上，x2 在下
+            top_half = torch.where(mask_odd, x2, x1)
+            bot_half = torch.where(mask_odd, x1, x2)
+            
+            # 3. 完美咬合！只创建一次最终的输出张量
+            total = torch.stack((top_half, bot_half), dim=3).view(B, C2, H2, W)
+
+        return total
+==================================================
+FILE: ./motionVectorDeinterlacing/models/backbones/__init__.py
+==================================================
+from .feature_extractor import SimpleFeatureExtractor, ResidualFeatureExtractor
+==================================================
+FILE: ./motionVectorDeinterlacing/models/backbones/feature_extractor.py
+==================================================
+import torch
+import torch.nn as nn
+from motionVectorDeinterlacing.models.registry import COMPONENT_REGISTRY
+from motionVectorDeinterlacing.models.components.blocks import ChannelAttentionBlock
+# ==========================================
+# 方案 A: 极简卷积版 (Vanilla Convolution)
+# 特点：计算量极小，适合低性能设备
+# ==========================================
+@COMPONENT_REGISTRY.register('SimpleFeatureExtractor')
+class SimpleFeatureExtractor(nn.Module):
+    # 既然写死了，__init__ 里的 act_cfg 参数也可以删掉了，保持接口清爽
+    def __init__(self, in_channels=3, nf=32):
+        super().__init__()
+        
+        self.body = nn.Sequential(
+            nn.Conv2d(in_channels, nf, 3, 1, 1),
+            # 直接实例化类，斜率设为底层视觉常用的 0.1
+            # inplace=True 可以直接覆盖原内存，这在你的实时流处理中能省下不少显存
+            nn.LeakyReLU(0.1, inplace=True), 
+            nn.Conv2d(nf, nf, 3, 1, 1),
+            nn.LeakyReLU(0.1, inplace=True)
+        )
+
+    def forward(self, x):
+        return self.body(x)
+
+# ==========================================
+# 方案 B: 5个残差块版 (Deep Residual RepConv)
+# 特点：感受野大，特征提取能力强，支持重参数化白嫖性能
+# ==========================================
+@COMPONENT_REGISTRY.register('ResidualFeatureExtractor')
+class ResidualFeatureExtractor(nn.Module):
+    def __init__(self, in_channels=3, nf=32, num_blocks=5, act_cfg="PReLU", deploy=False):
+        super().__init__()
+        # 1. 第一层将 RGB 转为特征通道
+        self.conv_first = nn.Conv2d(in_channels, nf, 3, 1, 1)
+        
+        # 2. 串联 5 个带有通道注意力的残差块
+        # 内部使用 RepConv，训练时多分支，部署时融合成单层
+        self.body = nn.Sequential(*[
+            ChannelAttentionBlock(nf=nf, act_cfg=act_cfg, res_scale=0.1, deploy=deploy)
+            for _ in range(num_blocks)
+        ])
+        
+        self.conv_last = nn.Conv2d(nf, nf, 3, 1, 1)
+
+    def forward(self, x):
+        feat = self.conv_first(x)
+        res = self.body(feat)
+        out = self.conv_last(res)
+        return out + feat # 全局残差连接，保证深层网络信号稳定
+
+
+==================================================
+FILE: ./motionVectorDeinterlacing/models/modules/gmc.py
+==================================================
+# models/modules/gmc.py
+from ..registry import COMPONENT_REGISTRY  # 导入组件注册表
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import cv2  # 工业级图像处理通常依赖 cv2 的 RANSAC，速度最快
+from motionVectorDeinterlacing.utils.ops import mv_warp
+import logging # 在文件开头导入
+
+@COMPONENT_REGISTRY.register('GMC')  # <--- 加上这一行！
+class GlobalMotionCompensator(nn.Module):
+    def __init__(self, min_inliers=10, max_scale_err=0.2, max_trans_err=0.2):
+        """
+        Args:
+            min_inliers (int): 最少需要多少个一致点，少于这个数直接放弃 GMC。
+            max_scale_err (float): 允许的最大缩放误差 (比如 0.2 代表只允许 0.8~1.2 倍缩放)。
+            max_trans_err (float): 允许的最大平移误差 (相对图像宽高的比例)。
+        """
+        super().__init__()
+        self.min_inliers = min_inliers
+        self.max_scale_err = max_scale_err
+        self.max_trans_err = max_trans_err
+
+    def _tensor_to_numpy_pts(self, flow):
+        """
+        把稀疏的光流图转换为点集 (Src -> Dst)
+        flow: [2, H, W]
+        Return: src_pts (N, 2), dst_pts (N, 2)
+        """
+        # 1. 找到所有非零向量的坐标（简单过滤静止背景和无效区域）
+        # 这里假设 flow 绝对值大于 0.1 的才算有效运动，去除噪点
+        mag = torch.sum(flow**2, dim=0).sqrt()
+        valid_mask = mag > 0.1
+        
+        y_idxs, x_idxs = torch.where(valid_mask)
+        
+        if len(y_idxs) < self.min_inliers:
+            return None, None
+
+        # Src: 原始坐标 (x, y)
+        src_pts = torch.stack([x_idxs, y_idxs], dim=1).float()
+        
+        # Dst: 目标坐标 = 原始坐标 + 光流
+        # 注意 flow 的顺序通常是 [x_flow, y_flow] 或 [y, x]，要根据你项目确认！
+        # 假设 flow 是 [dx, dy]
+        deltas = flow[:, y_idxs, x_idxs].permute(1, 0) # (N, 2)
+        dst_pts = src_pts + deltas
+
+        return src_pts.cpu().numpy(), dst_pts.cpu().numpy()
+
+    def _calculate_affine_robust(self, flow, H, W):
+        """核心：带熔断机制的矩阵计算"""
+        src, dst = self._tensor_to_numpy_pts(flow)
+        
+        # === 熔断 1: 点太少 ===
+        if src is None or len(src) < self.min_inliers:
+            return torch.eye(2, 3)
+
+        # 使用 OpenCV 的 RANSAC 估算仿射矩阵 (2x3)
+        # cv2.estimateAffinePartial2D 比 estimateAffine2D 更稳，它限制了剪切(Shear)
+        # 只允许：平移 + 旋转 + 统一缩放 (最符合摄像机运动)
+        try:
+            matrix, _ = cv2.estimateAffinePartial2D(
+                src, dst, 
+                method=cv2.RANSAC, 
+                ransacReprojThreshold=3.0
+            )
+        except Exception as e:
+            # 真正使用 logging 记录警告！
+            # 用 warning 级别，这样在查阅训练/推理日志时能轻易过滤出来
+            logging.warning(
+                f"[GMC] OpenCV estimateAffinePartial2D failed. "
+                f"Error: {e} | src shape: {src.shape}, dst shape: {dst.shape}. "
+                f"Fallback to Identity matrix."
+            )
+            
+            # 依然执行熔断，返回单位矩阵保命
+            return torch.eye(2, 3)
+
+        # === 熔断 2: 算失败了 ===
+        if matrix is None:
+            return torch.eye(2, 3)
+
+        # === 熔断 3: 检查矩阵是否“疯了” (Sanity Check) ===
+        # 矩阵结构: [[s*cos, -s*sin, tx], [s*sin, s*cos, ty]]
+        sx = np.sqrt(matrix[0, 0]**2 + matrix[0, 1]**2)
+        sy = np.sqrt(matrix[1, 0]**2 + matrix[1, 1]**2)
+        
+        # 检查缩放是否过大/过小 (摄像机一般不会突然变焦两倍)
+        if abs(sx - 1) > self.max_scale_err or abs(sy - 1) > self.max_scale_err:
+            return torch.eye(2, 3)
+
+        # 检查平移是否飞出屏幕 (比如平移量超过了图像的 20%)
+        tx, ty = matrix[0, 2], matrix[1, 2]
+        if abs(tx) > W * self.max_trans_err or abs(ty) > H * self.max_trans_err:
+            return torch.eye(2, 3)
+
+        return torch.from_numpy(matrix).float()
+
+    def get_global_flow_map(self, affine_matrix, H, W, device):
+        """把 2x3 矩阵还原成 Dense Flow Map"""
+        # 如果是单位矩阵，直接返回 0
+        if torch.equal(affine_matrix, torch.eye(2, 3).to(affine_matrix)):
+            return torch.zeros((1, 2, H, W), device=device)
+            
+        # 生成网格
+        y, x = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
+        # Homogeneous coordinates: [x, y, 1]
+        grid = torch.stack([x, y, torch.ones_like(x)], dim=-1).float().to(device) # (H, W, 3)
+        grid = grid.unsqueeze(0) # (1, H, W, 3)
+        
+        # Apply matrix: (1, H, W, 3) @ (2, 3).T -> (1, H, W, 2)
+        # grid points (new)
+        new_grid = grid @ affine_matrix.T.to(device)
+        
+        # Global Flow = New Pos - Old Pos
+        # grid[..., :2] 取出 x, y
+        global_flow = new_grid - grid[..., :2]
+        
+        # Permute to (B, 2, H, W)
+        return global_flow.permute(0, 3, 1, 2)
+
+    # ... 前面的 __init__ 和矩阵计算方法完全保持不变 ...
+
+    def forward(self, raw_mv_blocks, H, W, interpolation_mode='bilinear'):
+        """
+        Args:
+            raw_mv_blocks: [B, 2, h_small, w_small] 稀疏MV
+            H, W: 目标分辨率
+            interpolation_mode: 'bilinear' (适配普通 Refiner) 或 'nearest' (适配 Convex)
+        Returns:
+            object_motion: [B, 2, H, W] 去除背景后的物体运动
+            global_flow: [B, 2, H, W] 背景运动
+        """
+        B, _, h_small, w_small = raw_mv_blocks.shape
+        device = raw_mv_blocks.device
+        
+        global_flow_list = []
+        
+        # 1. 计算仿射矩阵并转为 Dense Global Flow
+        for i in range(B):
+            matrix = self._calculate_affine_robust(raw_mv_blocks[i], H, W)
+            g_flow = self.get_global_flow_map(matrix, H, W, device)
+            global_flow_list.append(g_flow)
+            
+        global_flow = torch.cat(global_flow_list, dim=0) # [B, 2, H, W] 全分辨率摄像机运动
+        
+        # ==========================================
+        # 2. 根据不同的 Refiner 需求，执行不同的剥离策略
+        # ==========================================
+        if interpolation_mode == 'bilinear':
+            # 【适配普通 Refiner】(如 ImageGuided, Gated, Vanilla)
+            # 直接把原始 MV 平滑放大，在全分辨率下做减法
+            dense_total_mv = F.interpolate(
+                raw_mv_blocks, size=(H, W), mode='bilinear', align_corners=False
+            )
+            object_motion = dense_total_mv - global_flow
+            
+        elif interpolation_mode == 'nearest':
+            # 【适配 Convex Upsampling Refiner】
+            # 必须保持宏块的马赛克边缘不被破坏！
+            down_factor = H // h_small
+            
+            # a. 把全分辨率的 global_flow 降采样回宏块大小
+            global_flow_lr = F.avg_pool2d(global_flow, kernel_size=down_factor, stride=down_factor)
+            
+            # b. 在低分辨率下做减法，得到纯正的“马赛克物体运动”
+            object_motion_lr = raw_mv_blocks - global_flow_lr
+            
+            # c. 用 nearest 放大到全分辨率，保持锐利的马赛克边缘，交给 Convex 处理
+            object_motion = F.interpolate(
+                object_motion_lr, size=(H, W), mode='nearest'
+            )
+        else:
+            raise ValueError(f"Unsupported interpolation_mode: {interpolation_mode}")
+        
+        return object_motion, global_flow
+    
+@COMPONENT_REGISTRY.register('IdentityGMC')
+class IdentityGMC(nn.Module):
+    def __init__(self, **kwargs):
+        super().__init__()
+
+    def forward(self, raw_mv_blocks, H, W, interpolation_mode='bilinear'):
+        # 1. 直接把原始稀疏 MV 放大到全分辨率
+        # 即使不做背景补偿，也要支持不同的插值方式（bilinear 或 nearest）
+        # 这样才能配合不同的 Refiner (比如 ConvexUpsamplingRefiner)
+        dense_total_mv = F.interpolate(
+            raw_mv_blocks, size=(H, W), mode=interpolation_mode
+        )
+        
+        # 2. 模拟解耦接口：物体运动 = 总运动，背景运动 = 0
+        global_flow = torch.zeros_like(dense_total_mv)
+        
+        return dense_total_mv, global_flow
+==================================================
+FILE: ./motionVectorDeinterlacing/models/modules/__init__.py
+==================================================
+from .gmc import GlobalMotionCompensator, IdentityGMC

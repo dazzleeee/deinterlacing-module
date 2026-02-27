@@ -1,55 +1,23 @@
-import numpy as np
 import cv2
+import numpy as np
 
-def flow_to_image(flow):
+def flow_to_color(flow_tensor, max_val=None):
     """
-    将光流/MV 转换为可视化图像 (RGB)。
-    
-    Args:
-        flow: numpy array of shape [H, W, 2]. 
-              flow[:,:,0] 是水平位移 (x), flow[:,:,1] 是垂直位移 (y).
-    Returns:
-        vis_img: numpy array of shape [H, W, 3], range [0, 255], uint8.
+    将 [2, H, W] 的光流 Tensor 转为 HWC 的 RGB 图像用于保存
     """
+    flow = flow_tensor.detach().cpu().numpy().transpose(1, 2, 0)
     h, w = flow.shape[:2]
     
-    # 1. 创建 HSV 画布
-    # H (Hue): 色相，代表方向
-    # S (Saturation): 饱和度，代表大小
-    # V (Value): 亮度，设为最大 255
-    hsv = np.zeros((h, w, 3), dtype=np.uint8)
-    hsv[..., 1] = 255
-    
-    # 2. 将直角坐标 (x, y) 转换为极坐标 (magnitude, angle)
-    # mag: 向量长度 (速度)，ang: 向量角度 (方向)
+    # 转换为极坐标 (角度代表颜色，长度代表亮度)
     mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
     
-    # 3. 映射角度到色相 (Hue)
-    # OpenCV 的 Hue 范围是 [0, 179]，所以角度 / 2
-    hsv[..., 0] = ang * 180 / np.pi / 2
+    hsv = np.zeros((h, w, 3), dtype=np.uint8)
+    hsv[..., 0] = ang * 180 / np.pi / 2 # 色相 (0-180)
+    hsv[..., 1] = 255                   # 饱和度最大
     
-    # 4. 映射大小到亮度 (Value)
-    # 归一化：让最大的运动变成最亮 (255)
-    # 这里的 cv2.normalize 是为了让可视化更明显，把运动放大到 0-255 范围
-    hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
+    if max_val is None:
+        max_val = np.max(mag) + 1e-6
+    hsv[..., 2] = np.clip(mag * 255 / max_val, 0, 255) # 亮度反映运动大小
     
-    # 5. HSV 转 RGB
-    rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-    
+    rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
     return rgb
-
-# --- 测试代码 ---
-if __name__ == '__main__':
-    # 造一个伪造的 MV: H=256, W=256, 2通道
-    dummy_flow = np.zeros((256, 256, 2), dtype=np.float32)
-    
-    # 让左半部分向右动 (x=5)，右半部分向下动 (y=5)
-    dummy_flow[:, :128, 0] = 5.0
-    dummy_flow[:, 128:, 1] = 5.0
-    
-    # 可视化
-    vis_img = flow_to_image(dummy_flow)
-    
-    # 保存
-    cv2.imwrite('test_flow_vis.png', vis_img)
-    print("Flow visualization saved to test_flow_vis.png")
