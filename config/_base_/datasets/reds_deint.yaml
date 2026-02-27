@@ -1,7 +1,7 @@
 dataset:
   train:
     type: 'RedsDeintDataset'
-    root_dir: 'data/REDS'
+    root_dir: 'data/REDS_link'
     split: 'train'
     seq_len: 15
     crop_lr: 64
@@ -11,7 +11,7 @@ dataset:
     num_workers: 4
   val:
     type: 'RedsDeintDataset'
-    root_dir: 'data/REDS'
+    root_dir: 'data/REDS_link'
     split: 'val'
     seq_len: 30
     crop_lr: null

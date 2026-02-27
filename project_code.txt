@@ -297,9 +297,9 @@ FILE: ./config/_base_/datasets/reds_deint.yaml
 dataset:
   train:
     type: 'RedsDeintDataset'
-    root_dir: 'data/REDS'
+    root_dir: 'data/REDS_link'
     split: 'train'
-    seq_len: 5
+    seq_len: 15
     crop_lr: 64
     augment: true
     use_lmdb: true
@@ -307,9 +307,9 @@ dataset:
     num_workers: 4
   val:
     type: 'RedsDeintDataset'
-    root_dir: 'data/REDS'
+    root_dir: 'data/REDS_link'
     split: 'val'
-    seq_len: 5
+    seq_len: 30
     crop_lr: null
     augment: false
     use_lmdb: true
