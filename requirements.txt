@@ -3,9 +3,7 @@ numpy
 opencv_python==4.12.0.88
 pandas==3.0.1
 pydantic==2.12.5
-PyYAML==6.0.1
 PyYAML==6.0.3
-setuptools==68.0.0
 setuptools==80.9.0
 scikit-image
 thop==0.1.1.post2209072238
