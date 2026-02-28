@@ -50,7 +50,7 @@ class FieldAwareMaskedTemporalLoss(nn.Module):
             
             mask_hr = 1.0
             if masks is not None:
-                mask_hr = F.interpolate(masks[:, t].unsqueeze(1), size=(H2, W), mode='bilinear', align_corners=False).squeeze(1)
+                mask_hr = F.interpolate(masks[:, t].unsqueeze(1), size=(H2, W), mode='bilinear', align_corners=False)
             
             warped_prev = mv_warp(prev_sr, flow_hr) 
             diff = torch.abs(curr_sr - warped_prev)

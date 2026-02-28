@@ -46,6 +46,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train RealTimeMVDnet')
     parser.add_argument('-c', '--config', type=str, required=True, help='Path to config yaml')
     parser.add_argument('--local_rank', type=int, default=-1, help='For DDP')
+    parser.add_argument('-r', '--resume', type=str, default=None, help='Path to checkpoint to resume from') # <-- 新增
     return parser.parse_args()
 
 class AttrDict(dict):
@@ -59,7 +60,7 @@ class AttrDict(dict):
 
 def main():
     args = parse_args()
-    
+
     # 1. 唤醒 DDP
     init_dist(args.local_rank)
     
@@ -86,7 +87,7 @@ def main():
     # --- FIX ENDS HERE ---
     
     # 3. 启动 Runner
-    runner = TrainRunner(cfg, exp_dir) 
+    runner = TrainRunner(cfg, exp_dir, resume_path=args.resume) 
     runner.train()
 
 if __name__ == '__main__':

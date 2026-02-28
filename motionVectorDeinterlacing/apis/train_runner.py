@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter # ✅ 引入 TensorBoard
 import logging
 import os
+import math
 
 from motionVectorDeinterlacing.models.registry import ARCH_REGISTRY, LOSS_REGISTRY
 
@@ -15,7 +16,7 @@ from motionVectorDeinterlacing.utils.distributionUtil import is_master, get_dist
 from motionVectorDeinterlacing.utils.ema import ModelEMA
 
 class TrainRunner:
-    def __init__(self, cfg, exp_dir):
+    def __init__(self, cfg, exp_dir, resume_path=None):
         self.cfg = cfg
         self.exp_dir = exp_dir
         self.rank, self.world_size = get_dist_info()
@@ -23,7 +24,10 @@ class TrainRunner:
         
         # 1. 数据加载
         self.train_loader = build_dataloader(cfg.dataset['train'], self.world_size, self.rank)
-        
+        if is_master():
+            self.val_loader = build_dataloader(cfg.dataset['val'], world_size=1, rank=0)
+            self.best_psnr = 0.0 # 记录历史最高分
+
         # 2. 模型与 DDP
         
         self.model = ARCH_REGISTRY.get('RealTimeMVDnet')(cfg.model).to(self.device)
@@ -53,6 +57,38 @@ class TrainRunner:
         
         # ✅ 只在主进程开启 TensorBoard Writer
         self.writer = SummaryWriter(log_dir=os.path.join(exp_dir, 'tb_logs')) if is_master() else None
+        
+        if resume_path is not None and os.path.exists(resume_path):
+            self.load_checkpoint(resume_path)
+    
+    def load_checkpoint(self, resume_path):
+        """恢复训练状态的终极魔法"""
+        if is_master():
+            self.logger.info(f"🔄 正在从 {resume_path} 恢复训练...")
+        
+        checkpoint = torch.load(resume_path, map_location=self.device)
+        
+        # 1. 恢复轮次和全局步数
+        self.start_epoch = checkpoint['epoch'] + 1
+        self.global_step = self.start_epoch * len(self.train_loader)
+        
+        # 2. 恢复模型权重 (处理 DDP 的 module 前缀)
+        model_state = checkpoint['state_dict']
+        if self.world_size > 1:
+            self.model.module.load_state_dict(model_state)
+        else:
+            self.model.load_state_dict(model_state)
+            
+        # 3. 恢复 EMA 影子模型
+        self.ema.module.load_state_dict(checkpoint['ema_state_dict'])
+        
+        # 4. 恢复优化器、调度器和混合精度 Scaler
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.scheduler.load_state_dict(checkpoint['scheduler'])
+        self.scaler.load_state_dict(checkpoint['scaler'])
+        
+        if is_master():
+            self.logger.info(f"✅ 成功恢复！将从 Epoch {self.start_epoch} 继续训练。")
 
     def train(self):
         for epoch in range(self.start_epoch, self.total_epochs):
@@ -134,10 +170,73 @@ class TrainRunner:
             # 保存模型
             if is_master():
                 self.save_checkpoint(epoch)
+                self.evaluate(epoch)
 
         if is_master() and self.writer is not None:
             self.writer.close()
 
+    @torch.no_grad()
+    def evaluate(self, epoch):
+        self.logger.info(f"🔍 开始进行 Epoch {epoch} 的验证集评估...")
+        
+        # ⚠️ 极度关键：验证时必须使用 EMA 影子模型，这才是我们最终要部署的稳定权重！
+        eval_model = self.ema.module
+        eval_model.eval()
+        
+        total_psnr = 0.0
+        total_frames = 0
+        
+        for data in self.val_loader:
+            imgs = data['lr'].to(self.device)
+            hr_targets = data['hr'].to(self.device)
+            mv_fwd = data['mv_fwd'].to(self.device)
+            field_ids = data['field_ids'].to(self.device)
+            
+            # 如果是新视频序列，重置模型的隐藏状态缓存
+            is_new_video = data.get('is_new_video', [False])[0]
+            if is_new_video and hasattr(eval_model, 'reset_state'):
+                eval_model.reset_state()
+            
+            # 推理
+            sr_outs = eval_model(imgs, mv_fwd, field_ids)
+            
+            # 计算 PSNR (将图像 Clamp 到 0~1 之间)
+            B, T = sr_outs.shape[:2]
+            for t in range(T):
+                sr_clamped = torch.clamp(sr_outs[0, t], 0.0, 1.0)
+                mse = torch.mean((sr_clamped - hr_targets[0, t]) ** 2)
+                
+                if mse > 0:
+                    psnr = 10 * math.log10(1.0 / mse.item())
+                else:
+                    psnr = 100.0
+                    
+                total_psnr += psnr
+                total_frames += 1
+                
+        # 计算平均分并记录
+        avg_psnr = total_psnr / total_frames if total_frames > 0 else 0
+        self.logger.info(f"📊 Epoch {epoch} 验证完成 | Avg PSNR: {avg_psnr:.2f} dB")
+        self.writer.add_scalar("Val/PSNR", avg_psnr, epoch)
+        
+        # 🏆 保存 Best Model
+        if avg_psnr > self.best_psnr:
+            self.best_psnr = avg_psnr
+            best_save_path = os.path.join(self.exp_dir, "best_model.pth")
+            
+            # 保存最纯粹的权重结构，方便推理直接调用
+            torch.save({
+                'epoch': epoch,
+                'psnr': avg_psnr,
+                'state_dict': self.model.module.state_dict() if self.world_size > 1 else self.model.state_dict(),
+                'ema_state_dict': self.ema.module.state_dict(),
+            }, best_save_path)
+            
+            self.logger.info(f"🎉 发现新最优模型！PSNR: {avg_psnr:.2f} dB，已更新 {best_save_path}")
+            
+        # 验证结束，切回训练模式
+        self.model.train()
+        
     def save_checkpoint(self, epoch):
         model_state = self.model.module.state_dict() if self.world_size > 1 else self.model.state_dict()
         save_path = os.path.join(self.exp_dir, f"epoch_{epoch}.pth")
