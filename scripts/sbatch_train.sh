@@ -9,7 +9,9 @@
 #SBATCH --mem=128000M
 
 # 1. 明确进入代码根目录 [cite: 20, 21]
-cd /home/sihanuo/projects/def-jyzhao/SihanZhang/deinterlacing/deinterlacing-module
+cd $SLURM_SUBMIT_DIR/..
+
+echo "Current working directory is: $(pwd)"
 
 # 2. 准备基础目录 
 mkdir -p logs
