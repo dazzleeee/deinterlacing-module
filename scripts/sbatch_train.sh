@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=mvd_train
-#SBATCH --output=scripts/log/train_log_%j.out
-#SBATCH --error=scripts/log/train_err_%j.err
+#SBATCH --output=scripts/logs/train_log_%j.out
+#SBATCH --error=scripts/logs/train_err_%j.err
 #SBATCH --time=12:00:00
 #SBATCH --nodes=1
 #SBATCH --gpus=h100:2

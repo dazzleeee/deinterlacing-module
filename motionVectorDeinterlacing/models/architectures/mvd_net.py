@@ -164,7 +164,7 @@ class RealTimeMVDnet(nn.Module):
                 else:
                     t_order2_warped_bwd = torch.zeros_like(t_order1_warped_bwd) 
 
-                fusion_order1and2_bwd, _, _ = self.first_2nd_order_fusion(t_order1_warped_bwd, t_order2_warped_bwd)
+                fusion_order1and2_bwd, _, _ = self.first_2nd_order_fusion(feats[:, t], t_order1_warped_bwd, t_order2_warped_bwd)
                 h_bwd, _ = self.h_prop_current_feat_fusion(fusion_order1and2_bwd, feats[:, t])
                 
                 h_bwd_in = torch.cat([h_bwd, feats[:, t]], dim=1) 
@@ -201,7 +201,7 @@ class RealTimeMVDnet(nn.Module):
                     t_order2_warped_fwd = torch.zeros_like(feats[:, t])
 
                 if has_tm1 or has_tm2:
-                    fusion_order1and2_fwd, _, _ = self.first_2nd_order_fusion(t_order1_warped_fwd, t_order2_warped_fwd)
+                    fusion_order1and2_fwd, _, _ = self.first_2nd_order_fusion(feats[:, t], t_order1_warped_fwd, t_order2_warped_fwd)
                     h_fwd, _ = self.h_prop_current_feat_fusion(fusion_order1and2_fwd, feats[:, t])
                 else:
                     h_fwd = feats[:, t]
@@ -280,7 +280,7 @@ class RealTimeMVDnet(nn.Module):
                     else:
                         t_order2_warped_bwd = torch.zeros_like(t_order1_warped_bwd) 
 
-                    fusion_order1and2_bwd, _, _ = self.first_2nd_order_fusion(t_order1_warped_bwd, t_order2_warped_bwd)
+                    fusion_order1and2_bwd, _, _ = self.first_2nd_order_fusion(feats[:, t], t_order1_warped_bwd, t_order2_warped_bwd)
                     h_bwd, _ = self.h_prop_current_feat_fusion(fusion_order1and2_bwd, feats[:, t])
                     
                     h_bwd_in = torch.cat([h_bwd, feats[:, t]], dim=1)
@@ -314,7 +314,7 @@ class RealTimeMVDnet(nn.Module):
                         t_order2_warped_fwd = torch.zeros_like(feats[:, t])
 
                     if h_tm1 is not None or h_tm2 is not None:
-                        fusion_order1and2_fwd, _, _ = self.first_2nd_order_fusion(t_order1_warped_fwd, t_order2_warped_fwd)
+                        fusion_order1and2_fwd, _, _ = self.first_2nd_order_fusion(feats[:, t], t_order1_warped_fwd, t_order2_warped_fwd)
                         h_fwd, _ = self.h_prop_current_feat_fusion(fusion_order1and2_fwd, feats[:, t])
                     else:
                         h_fwd = feats[:, t]

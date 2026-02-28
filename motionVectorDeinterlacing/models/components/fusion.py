@@ -136,7 +136,7 @@ class SimpleAverageFusion(nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
 
-    def forward(self, h1_warped, h2_warped):
+    def forward(self, curr_feat, h1_warped, h2_warped):
         h_prop = (h1_warped + h2_warped) * 0.5
         # 返回虚拟权重对齐接口
         B, _, H, W = h1_warped.shape

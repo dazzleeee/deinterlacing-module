@@ -1,0 +1,87 @@
+The following modules were not unloaded:
+  (Use "module --force purge" to unload all):
+
+  1) CCconfig        6)  ucx/1.14.1         11) flexiblas/3.3.1
+  2) gentoo/2023     7)  libfabric/1.18.0   12) imkl/2023.2.0
+  3) gcccore/.12.3   8)  pmix/4.2.4         13) StdEnv/2023
+  4) gcc/12.3        9)  ucc/1.2.0
+  5) hwloc/2.9.1     10) openmpi/4.1.5
+2026-02-28 01:42:25,917 - INFO - Experiment Dir: work_dirs/.tmp_9473712_v3_ablation_no_gmc_20260228_014225
+/project/6083632/SihanZhang/deinterlacingGit/deinterlacing-module/motionVectorDeinterlacing/apis/train_runner.py:43: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  self.scaler = GradScaler()
+/project/6083632/SihanZhang/deinterlacingGit/deinterlacing-module/motionVectorDeinterlacing/apis/train_runner.py:43: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  self.scaler = GradScaler()
+/project/6083632/SihanZhang/deinterlacingGit/deinterlacing-module/motionVectorDeinterlacing/apis/train_runner.py:110: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast():
+/project/6083632/SihanZhang/deinterlacingGit/deinterlacing-module/motionVectorDeinterlacing/apis/train_runner.py:110: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast():
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/project/6083632/SihanZhang/deinterlacingGit/deinterlacing-module/train.py", line 94, in <module>
+[rank1]:     main()
+[rank1]:   File "/project/6083632/SihanZhang/deinterlacingGit/deinterlacing-module/train.py", line 91, in main
+[rank1]:     runner.train()
+[rank1]:   File "/project/6083632/SihanZhang/deinterlacingGit/deinterlacing-module/motionVectorDeinterlacing/apis/train_runner.py", line 111, in train
+[rank1]:     outputs = self.model(imgs, mv_fwd, field_ids)
+[rank1]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/project/6083632/SihanZhang/deinterlacing/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/project/6083632/SihanZhang/deinterlacing/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/project/6083632/SihanZhang/deinterlacing/.venv/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1648, in forward
+[rank1]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank1]:          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/project/6083632/SihanZhang/deinterlacing/.venv/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1474, in _run_ddp_forward
+[rank1]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/project/6083632/SihanZhang/deinterlacing/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/project/6083632/SihanZhang/deinterlacing/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/project/6083632/SihanZhang/deinterlacingGit/deinterlacing-module/motionVectorDeinterlacing/models/architectures/mvd_net.py", line 167, in forward
+[rank1]:     fusion_order1and2_bwd, _, _ = self.first_2nd_order_fusion(t_order1_warped_bwd, t_order2_warped_bwd)
+[rank1]:                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/project/6083632/SihanZhang/deinterlacing/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/project/6083632/SihanZhang/deinterlacing/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]: TypeError: DeinterlacingMultiOrderFusion.forward() missing 1 required positional argument: 'h2_warped'
+W0228 01:43:43.709000 621757 torch/distributed/elastic/multiprocessing/api.py:900] Sending process 621791 closing signal SIGTERM
+E0228 01:43:43.713000 621757 torch/distributed/elastic/multiprocessing/api.py:874] failed (exitcode: 1) local_rank: 1 (pid: 621792) of binary: /project/6083632/SihanZhang/deinterlacing/.venv/bin/python3
+Traceback (most recent call last):
+  File "/project/6083632/SihanZhang/deinterlacing/.venv/bin/torchrun", line 10, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/project/6083632/SihanZhang/deinterlacing/.venv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/project/6083632/SihanZhang/deinterlacing/.venv/lib/python3.11/site-packages/torch/distributed/run.py", line 901, in main
+    run(args)
+  File "/project/6083632/SihanZhang/deinterlacing/.venv/lib/python3.11/site-packages/torch/distributed/run.py", line 892, in run
+    elastic_launch(
+  File "/project/6083632/SihanZhang/deinterlacing/.venv/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 143, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/project/6083632/SihanZhang/deinterlacing/.venv/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 277, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+train.py FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-02-28_01:43:43
+  host      : g15
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 621792)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
