@@ -81,7 +81,7 @@ class RealTimeMVDnet(nn.Module):
         self.last_conv = nn.Conv2d(self.mid, 3, 3, 1, 1)
 
         # 核心护城河：全局前向隐状态缓存
-        self.register_buffer('h_fwd_cache', None)
+        self.h_fwd_cache = None
 
         self.init_weights()
 
@@ -93,6 +93,7 @@ class RealTimeMVDnet(nn.Module):
 
     def reset_state(self):
         self.h_fwd_cache = None
+        self.stream_cache = None
 
     def _refine_mv_with_gmc(self, raw_pixel_mv, feat_target, feat_ref):
         B, C, H, W = feat_target.shape
@@ -115,6 +116,104 @@ class RealTimeMVDnet(nn.Module):
         
         final_mv = global_flow + refined_obj_motion
         return final_mv
+    
+    @torch.no_grad()
+    def forward_stream_step(self, imgs_win, mvs_win, fids_win):
+        """
+        真实的流式单步推理。每次严格接收一个长度为 3 的滑动窗口 [t, t+1, t+2]。
+        输出第 t 帧的高清结果，并更新内部状态。
+        """
+        B, T, C, H, W = imgs_win.shape
+        assert T == 3, "Stream step requires exactly a 3-frame window [t, t+1, t+2]"
+
+        # 1. 提取窗口内三帧的特征
+        flags = fids_win.view(B, T, 1, 1, 1).expand(B, T, 1, H, W).float()
+        inp = torch.cat([imgs_win, flags], dim=2)
+        feats = self.feat_extract(inp.view(-1, C + 1, H, W)).view(B, T, self.mid, H, W)
+
+        feat_t, feat_t1, feat_t2 = feats[:, 0], feats[:, 1], feats[:, 2]
+        mv_t, mv_t1, mv_t2 = mvs_win[:, 0], mvs_win[:, 1], mvs_win[:, 2]
+        fid_t, fid_t1, fid_t2 = fids_win[:, 0], fids_win[:, 1], fids_win[:, 2]
+
+        # ==========================================
+        # 2. 计算当前帧 t 的后向传播特征 (利用 t+1 和 t+2)
+        # ==========================================
+        # 2.1 将 t+2 warp 到 t+1
+        raw_mv_t1_ref_t2 = rescale_mv_temporal(
+            quarterPixelMV_to_pixelMV(-mv_t2), src_oe=fid_t2, tgt_oe=fid_t1
+        )
+        mv_t1_ref_t2 = self._refine_mv_with_gmc(raw_mv_t1_ref_t2, feat_t1, feat_t2)
+        t1_warped_from_t2 = mv_warp(feat_t2, mv_t1_ref_t2)
+        hidden_state_t1, _ = self.h_prop_current_feat_fusion(t1_warped_from_t2, feat_t1)
+        hidden_state_t1 = self.backward_resblocks(hidden_state_t1)
+
+        # 2.2 将上面算出的隐状态 warp 到 t
+        raw_mv_t_ref_t1 = rescale_mv_temporal(
+            quarterPixelMV_to_pixelMV(-mv_t1), src_oe=fid_t1, tgt_oe=fid_t
+        )
+        mv_t_ref_t1 = self._refine_mv_with_gmc(raw_mv_t_ref_t1, feat_t, feat_t1)
+        t_order1_warped_bwd = mv_warp(hidden_state_t1, mv_t_ref_t1)
+
+        # 2.3 将 t+2 直接 warp 到 t (二阶融合)
+        raw_mv_t_ref_t2 = quarterPixelMV_to_pixelMV(-mv_t2)
+        mv_t_ref_t2 = self._refine_mv_with_gmc(raw_mv_t_ref_t2, feat_t, feat_t2)
+        t_order2_warped_bwd = mv_warp(feat_t2, mv_t_ref_t2)
+
+        fusion_order1and2_bwd, *_ = self.first_2nd_order_fusion(feat_t, t_order1_warped_bwd, t_order2_warped_bwd)
+        h_bwd, _ = self.h_prop_current_feat_fusion(fusion_order1and2_bwd, feat_t)
+        
+        h_bwd_in = torch.cat([h_bwd, feat_t], dim=1)
+        h_bwd_in = self.bwd_channel_reduce(h_bwd_in)
+        bwd_feature_t = self.backward_resblocks(h_bwd_in)
+
+        # ==========================================
+        # 3. 计算当前帧 t 的前向传播特征 (读取流式 Cache)
+        # ==========================================
+        if self.stream_cache is None:
+            h_tm1, h_tm2, feat_tm1, feat_tm2, fid_tm1 = None, None, None, None, None
+        else:
+            h_tm1, h_tm2, feat_tm1, feat_tm2, fid_tm1 = self.stream_cache
+
+        if h_tm1 is not None and feat_tm1 is not None:
+            raw_mv_t_ref_tm1 = rescale_mv_temporal(
+                quarterPixelMV_to_pixelMV(mv_t), src_oe=fid_tm1, tgt_oe=fid_t
+            )
+            mv_t_ref_tm1 = self._refine_mv_with_gmc(raw_mv_t_ref_tm1, feat_t, feat_tm1)
+            t_order1_warped_fwd = mv_warp(h_tm1, mv_t_ref_tm1)
+        else:
+            t_order1_warped_fwd = torch.zeros_like(feat_t)
+
+        if h_tm2 is not None and feat_tm2 is not None:
+            raw_mv_t_ref_tm2 = quarterPixelMV_to_pixelMV(mv_t)
+            mv_t_ref_tm2 = self._refine_mv_with_gmc(raw_mv_t_ref_tm2, feat_t, feat_tm2)
+            t_order2_warped_fwd = mv_warp(h_tm2, mv_t_ref_tm2)
+        else:
+            t_order2_warped_fwd = torch.zeros_like(feat_t)
+
+        if h_tm1 is not None or h_tm2 is not None:
+            fusion_order1and2_fwd, *_ = self.first_2nd_order_fusion(feat_t, t_order1_warped_fwd, t_order2_warped_fwd)
+            h_fwd, _ = self.h_prop_current_feat_fusion(fusion_order1and2_fwd, feat_t)
+        else:
+            h_fwd = feat_t
+
+        bidirect_feat = torch.cat([h_fwd, bwd_feature_t, feat_t], dim=1)
+        bidirect_feat = self.fwd_channel_reduce(bidirect_feat)
+        h_fwd = self.forward_resblocks(bidirect_feat)
+
+        # ==========================================
+        # 4. 更新流式 Cache (为下一帧的到来做准备)
+        # ==========================================
+        self.stream_cache = (h_fwd.detach(), h_tm1, feat_t.detach(), feat_tm1, fid_t)
+
+        # ==========================================
+        # 5. 生成高分辨率图像
+        # ==========================================
+        up_feat = self.deint_up(h_fwd, o_e=fid_t)
+        hr_feat = self.refinement(up_feat)
+        out_residual = self.last_conv(hr_feat)
+        base_frame = F.interpolate(imgs_win[:, 0], scale_factor=(2, 1), mode='bilinear', align_corners=False)
+        
+        return out_residual + base_frame
 
     def forward(self, imgs, mv_fwd, field_ids):
         B, T, C, H, W = imgs.shape
@@ -164,7 +263,7 @@ class RealTimeMVDnet(nn.Module):
                 else:
                     t_order2_warped_bwd = torch.zeros_like(t_order1_warped_bwd) 
 
-                fusion_order1and2_bwd, _, _ = self.first_2nd_order_fusion(feats[:, t], t_order1_warped_bwd, t_order2_warped_bwd)
+                fusion_order1and2_bwd, *_= self.first_2nd_order_fusion(feats[:, t], t_order1_warped_bwd, t_order2_warped_bwd)
                 h_bwd, _ = self.h_prop_current_feat_fusion(fusion_order1and2_bwd, feats[:, t])
                 
                 h_bwd_in = torch.cat([h_bwd, feats[:, t]], dim=1) 
@@ -201,7 +300,7 @@ class RealTimeMVDnet(nn.Module):
                     t_order2_warped_fwd = torch.zeros_like(feats[:, t])
 
                 if has_tm1 or has_tm2:
-                    fusion_order1and2_fwd, _, _ = self.first_2nd_order_fusion(feats[:, t], t_order1_warped_fwd, t_order2_warped_fwd)
+                    fusion_order1and2_fwd, *_= self.first_2nd_order_fusion(feats[:, t], t_order1_warped_fwd, t_order2_warped_fwd)
                     h_fwd, _ = self.h_prop_current_feat_fusion(fusion_order1and2_fwd, feats[:, t])
                 else:
                     h_fwd = feats[:, t]
@@ -280,7 +379,7 @@ class RealTimeMVDnet(nn.Module):
                     else:
                         t_order2_warped_bwd = torch.zeros_like(t_order1_warped_bwd) 
 
-                    fusion_order1and2_bwd, _, _ = self.first_2nd_order_fusion(feats[:, t], t_order1_warped_bwd, t_order2_warped_bwd)
+                    fusion_order1and2_bwd, *_= self.first_2nd_order_fusion(feats[:, t], t_order1_warped_bwd, t_order2_warped_bwd)
                     h_bwd, _ = self.h_prop_current_feat_fusion(fusion_order1and2_bwd, feats[:, t])
                     
                     h_bwd_in = torch.cat([h_bwd, feats[:, t]], dim=1)
@@ -314,7 +413,7 @@ class RealTimeMVDnet(nn.Module):
                         t_order2_warped_fwd = torch.zeros_like(feats[:, t])
 
                     if h_tm1 is not None or h_tm2 is not None:
-                        fusion_order1and2_fwd, _, _ = self.first_2nd_order_fusion(feats[:, t], t_order1_warped_fwd, t_order2_warped_fwd)
+                        fusion_order1and2_fwd, *_= self.first_2nd_order_fusion(feats[:, t], t_order1_warped_fwd, t_order2_warped_fwd)
                         h_fwd, _ = self.h_prop_current_feat_fusion(fusion_order1and2_fwd, feats[:, t])
                     else:
                         h_fwd = feats[:, t]

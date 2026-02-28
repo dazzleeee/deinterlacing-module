@@ -1,6 +1,6 @@
 import torch
 from thop import profile
-from models.mvd_net import RealTimeMVDnet # 替换为你的路径
+from motionVectorDeinterlacing.models.architectures.mvd_net import RealTimeMVDnet
 from config.config_schema import MVDNetConfig
 
 def measure_flops_and_params(model, input_shape, device='cuda'):

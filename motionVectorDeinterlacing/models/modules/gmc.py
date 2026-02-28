@@ -158,20 +158,19 @@ class GlobalMotionCompensator(nn.Module):
             object_motion = dense_total_mv - global_flow
             
         elif interpolation_mode == 'nearest':
-            # 【适配 Convex Upsampling Refiner】
-            # 必须保持宏块的马赛克边缘不被破坏！
-            down_factor = H // h_small
+            # a. 直接用 area 插值将全分辨率 global_flow 降采样到目标 MV 的长宽
+            global_flow_lr = F.interpolate(
+                global_flow, size=(h_small, w_small), mode='area'
+            )
             
-            # a. 把全分辨率的 global_flow 降采样回宏块大小
-            global_flow_lr = F.avg_pool2d(global_flow, kernel_size=down_factor, stride=down_factor)
-            
-            # b. 在低分辨率下做减法，得到纯正的“马赛克物体运动”
+            # b. 在同分辨率下减去全局运动
             object_motion_lr = raw_mv_blocks - global_flow_lr
             
-            # c. 用 nearest 放大到全分辨率，保持锐利的马赛克边缘，交给 Convex 处理
+            # c. 再将局部运动向量放大回原图尺寸
             object_motion = F.interpolate(
                 object_motion_lr, size=(H, W), mode='nearest'
             )
+            
         else:
             raise ValueError(f"Unsupported interpolation_mode: {interpolation_mode}")
         

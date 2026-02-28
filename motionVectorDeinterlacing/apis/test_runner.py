@@ -12,13 +12,16 @@ from motionVectorDeinterlacing.datasets.builder import build_dataloader
 # 补丁：支持嵌套字典的“点号”访问
 # ==========================================
 class AttrDict(dict):
-    """Allows nested dictionary access via dot notation."""
+    """Allows nested dictionary access via dot notation (Deep version)."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.__dict__ = self
         for key, value in self.items():
             if isinstance(value, dict):
                 self[key] = AttrDict(value)
+            elif isinstance(value, list):
+                # 递归处理列表里的字典
+                self[key] = [AttrDict(i) if isinstance(i, dict) else i for i in value]
 
 def calculate_psnr(img1, img2):
     """简单的 PSNR 计算，假设输入范围是 [0, 1]"""
@@ -59,11 +62,10 @@ def test_runner(cfg, weight_path):
     total_ssim = 0.0
     
     with torch.no_grad():
+      
         for data in tqdm(test_loader, desc="Testing"):
-            is_new_video = data.get('is_new_video', [False])[0]
-            
-            # 当切换到新测试视频时，必须清空网络记忆
-            if is_new_video:
+            if data['is_new_video'][0] and hasattr(model, 'reset_state'):
+                
                 model.reset_state()
             
             # 数据上卡
@@ -103,8 +105,9 @@ if __name__ == "__main__":
     with open(args.config, 'r', encoding='utf-8') as f:
         cfg_dict = yaml.safe_load(f)
     
-    # 打上 AttrDict 补丁，让后续代码可以用 cfg.model 这种点号语法
     cfg = AttrDict(cfg_dict)
+    cfg.model = MVDNetConfig(**cfg_dict.get('model', {}))
+    test_runner(cfg, args.weight)
     
     # 启动评估
-    test_runner(cfg, args.weight)
+  

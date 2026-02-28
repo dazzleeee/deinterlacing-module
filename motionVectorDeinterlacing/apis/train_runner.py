@@ -121,14 +121,29 @@ class TrainRunner:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 
+                scale_before = self.scaler.get_scale()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+                scale_after = self.scaler.get_scale()
+
+                is_step_success = scale_before <= scale_after
+                if is_step_success:
+                    self.scheduler.step()
+                    # 修复 1：EMA 更新必须与 Optimizer 严格同频！
+                    self.ema.update(self.model)
+                else:
+                    # 修复 2：为了防止 T_max 走不完，在跳过更新时，
+                    # 我们可以选择静默增加 scheduler 的 internal step，
+                    # 骗过警告，保证 LR 曲线的时序进度完美对齐。
+                    import warnings
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        self.scheduler.step()
+                        
+            
+                   
                 
-                # ✅ 步进：调度器更新学习率
-                self.scheduler.step()
-                
-                # ✅ 步进：更新 EMA 影子模型的权重
-                self.ema.update(self.model)
+            
                 
                 # =======================================================
                 # 日志与可视化 (只在主进程 Rank 0 运行)
@@ -185,26 +200,29 @@ class TrainRunner:
         
         total_psnr = 0.0
         total_frames = 0
-        
+        current_clip = None
         for data in self.val_loader:
+            if data['is_new_video'][0] and hasattr(eval_model, 'reset_state'):
+                eval_model.reset_state()
+
             imgs = data['lr'].to(self.device)
             hr_targets = data['hr'].to(self.device)
             mv_fwd = data['mv_fwd'].to(self.device)
             field_ids = data['field_ids'].to(self.device)
             
-            # 如果是新视频序列，重置模型的隐藏状态缓存
-            is_new_video = data.get('is_new_video', [False])[0]
-            if is_new_video and hasattr(eval_model, 'reset_state'):
-                eval_model.reset_state()
+        
             
             # 推理
-            sr_outs = eval_model(imgs, mv_fwd, field_ids)
+            sr_outs = eval_model(imgs, mv_fwd, field_ids).detach()
             
             # 计算 PSNR (将图像 Clamp 到 0~1 之间)
             B, T = sr_outs.shape[:2]
             for t in range(T):
-                sr_clamped = torch.clamp(sr_outs[0, t], 0.0, 1.0)
-                mse = torch.mean((sr_clamped - hr_targets[0, t]) ** 2)
+                # 2. 将张量拉到 CPU 计算，彻底释放 GPU 显存压力
+                sr_clamped = torch.clamp(sr_outs[0, t], 0.0, 1.0).cpu()
+                hr_cpu = hr_targets[0, t].cpu()
+                
+                mse = torch.mean((sr_clamped - hr_cpu) ** 2)
                 
                 if mse > 0:
                     psnr = 10 * math.log10(1.0 / mse.item())

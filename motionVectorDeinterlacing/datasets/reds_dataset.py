@@ -9,6 +9,17 @@ import pickle
 import io
 from torch.utils.data import Dataset
 
+def _read_img_txn(self, txn, root, rel_path, is_lmdb=True):
+        """高效的底层读取，不主动开关事务"""
+        if is_lmdb:
+            buf = txn.get(rel_path.encode('ascii'))
+            if buf is None: raise ValueError(f"LMDB Key not found: {rel_path}")
+            img_np = np.frombuffer(buf, dtype=np.uint8)
+            img = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+        else:
+            img = cv2.imread(os.path.join(root, rel_path), cv2.IMREAD_COLOR)
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
 def to_tensor01(img):
     """将 numpy array [H, W, C] 转换为张量 [C, H, W] 并归一化到 0~1"""
     img = np.ascontiguousarray(img)
@@ -64,7 +75,8 @@ class RedsDeintDataset(Dataset):
                 clip_frames = [k for k in lr_keys if k.startswith(f"{clip}/lr/")]
                 total_frames = len(clip_frames)
                 if total_frames >= self.seq_len:
-                    for s in range(0, total_frames - self.seq_len + 1):
+                    step = 1 if self.split == 'train' else self.seq_len
+                    for s in range(0, total_frames - self.seq_len + 1, step):
                         self.samples.append((clip, s))
         else:
             # 传统文件夹遍历方式
@@ -73,7 +85,8 @@ class RedsDeintDataset(Dataset):
                 lr_dir = os.path.join(self.codec_root, clip, "lr")
                 total_frames = len(glob.glob(os.path.join(lr_dir, "*.png")))
                 if total_frames >= self.seq_len:
-                    for s in range(0, total_frames - self.seq_len + 1):
+                    step = 1 if self.split == 'train' else self.seq_len # 新增这行
+                    for s in range(0, total_frames - self.seq_len + 1, step): # 修改这行
                         self.samples.append((clip, s))
 
         print(f"[{split.upper()}] Dataset loaded: {len(self.samples)} samples from {len(self.clips)} clips. (LMDB: {self.use_lmdb})")
@@ -100,18 +113,19 @@ class RedsDeintDataset(Dataset):
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
     def _load_seq(self, clip, start):
-        # 确保 LMDB 在当前进程已打开
         if self.use_lmdb: self._init_lmdb()
-
         imgs_lr, imgs_gt, mv_fwd_list = [], [], []
 
-        # 1. 读取场极性标识 (npy)
+        # 🚀 核心优化：在序列开始前，全局开启一次只读事务！
+        txn_codec = self.env_codec.begin(write=False) if self.use_lmdb else None
+        txn_gt = self.env_gt.begin(write=False) if self.use_lmdb else None
+
+        # 1. 读取 field_ids (使用 txn_codec)
         fid_rel_path = f"{clip}/meta/field_ids.npy"
         if self.use_lmdb:
-            with self.env_codec.begin(write=False) as txn:
-                buf = txn.get(fid_rel_path.encode('ascii'))
-                with io.BytesIO(buf) as f:
-                    all_fids = np.load(f)
+            buf = txn_codec.get(fid_rel_path.encode('ascii'))
+            with io.BytesIO(buf) as f:
+                all_fids = np.load(f)
         else:
             all_fids = np.load(os.path.join(self.codec_root, fid_rel_path))
             
@@ -120,45 +134,39 @@ class RedsDeintDataset(Dataset):
 
         for t_idx in indices:
             fn = self.img_tmpl.format(t_idx)
-            
-            # 读取 LR 和 GT 图像
             lr_rel_path = f"{clip}/lr/{fn}"
-            gt_rel_path = f"{clip}/{fn}" # 假设 GT 里面直接是 png
+            gt_rel_path = f"{clip}/{fn}"
             
-            imgs_lr.append(self._read_img(self.env_codec, self.codec_root, lr_rel_path))
-            imgs_gt.append(self._read_img(self.env_gt, self.gt_root, gt_rel_path))
+            # 🚀 调用新方法，传入事务对象
+            imgs_lr.append(self._read_img_txn(txn_codec, self.codec_root, lr_rel_path, self.use_lmdb))
+            imgs_gt.append(self._read_img_txn(txn_gt, self.gt_root, gt_rel_path, self.use_lmdb))
             
             H_lr, W_lr, _ = imgs_lr[-1].shape
             base_name = os.path.splitext(fn)[0] 
-
-            # 2. 读取光流 (npz)
             mvf_rel_path = f"{clip}/mv_fwd/{base_name}_mv_fwd.npz"
-            mvf = np.zeros((2, H_lr, W_lr), np.float32) # 默认全 0，容错机制
+            mvf = np.zeros((2, H_lr, W_lr), np.float32)
             
             if self.use_lmdb:
-                with self.env_codec.begin(write=False) as txn:
-                    buf = txn.get(mvf_rel_path.encode('ascii'))
-                    if buf is not None:
-                        with io.BytesIO(buf) as f:
-                            f_arr = np.load(f)["flow_fwd"].astype(np.float32)
-                            if f_arr.ndim == 3 and f_arr.shape[2] == 2: 
-                                f_arr = np.transpose(f_arr, (2, 0, 1))
-                            mvf = f_arr
-            else:
-                p_fwd = os.path.join(self.codec_root, mvf_rel_path)
-                if os.path.exists(p_fwd):
-                    f_arr = np.load(p_fwd)["flow_fwd"].astype(np.float32)
-                    if f_arr.ndim == 3 and f_arr.shape[2] == 2: 
-                        f_arr = np.transpose(f_arr, (2, 0, 1))
-                    mvf = f_arr
-                    
+                buf = txn_codec.get(mvf_rel_path.encode('ascii'))
+                if buf is not None:
+                    with io.BytesIO(buf) as f:
+                        f_arr = np.load(f)["flow_fwd"].astype(np.float32)
+                        if f_arr.ndim == 3 and f_arr.shape[2] == 2: 
+                            f_arr = np.transpose(f_arr, (2, 0, 1))
+                        mvf = f_arr
+            # (省略 else 分支的本地读取，保持原样即可)
             mv_fwd_list.append(mvf)
 
+        # 🚀 养成好习惯：序列读完后关闭事务
+        if self.use_lmdb:
+            txn_codec.abort()
+            txn_gt.abort()
+
         return (
-            np.stack(imgs_lr, axis=0),      # [T, H, W, 3]
-            np.stack(imgs_gt, axis=0),      # [T, H*2, W, 3]
-            np.stack(mv_fwd_list, axis=0),  # [T, 2, H, W]
-            seq_fids                        # [T]
+            np.stack(imgs_lr, axis=0),
+            np.stack(imgs_gt, axis=0),
+            np.stack(mv_fwd_list, axis=0),
+            seq_fids
         )
 
     # ... 下面的 _random_crop, __getitem__, __len__ 完全保持你原来的代码不变 ...

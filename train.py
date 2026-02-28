@@ -50,13 +50,16 @@ def parse_args():
     return parser.parse_args()
 
 class AttrDict(dict):
-    """Allows nested dictionary access via dot notation."""
+    """Allows nested dictionary access via dot notation (Deep version)."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.__dict__ = self
         for key, value in self.items():
             if isinstance(value, dict):
                 self[key] = AttrDict(value)
+            elif isinstance(value, list):
+                # 递归处理列表里的字典
+                self[key] = [AttrDict(i) if isinstance(i, dict) else i for i in value]
 
 def main():
     args = parse_args()
