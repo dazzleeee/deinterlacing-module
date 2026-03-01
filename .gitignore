@@ -2,3 +2,6 @@ tools/data_process/verification_mv/
 data/
 out
 err
+*.log
+work_dirs
+__pycache__
