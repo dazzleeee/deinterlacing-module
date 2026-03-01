@@ -9,16 +9,7 @@ import pickle
 import io
 from torch.utils.data import Dataset
 
-def _read_img_txn(self, txn, root, rel_path, is_lmdb=True):
-        """高效的底层读取，不主动开关事务"""
-        if is_lmdb:
-            buf = txn.get(rel_path.encode('ascii'))
-            if buf is None: raise ValueError(f"LMDB Key not found: {rel_path}")
-            img_np = np.frombuffer(buf, dtype=np.uint8)
-            img = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
-        else:
-            img = cv2.imread(os.path.join(root, rel_path), cv2.IMREAD_COLOR)
-        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
 
 def to_tensor01(img):
     """将 numpy array [H, W, C] 转换为张量 [C, H, W] 并归一化到 0~1"""
@@ -97,6 +88,17 @@ class RedsDeintDataset(Dataset):
             self.env_codec = lmdb.open(self.codec_root, readonly=True, lock=False, readahead=False, meminit=False)
         if self.env_gt is None:
             self.env_gt = lmdb.open(self.gt_root, readonly=True, lock=False, readahead=False, meminit=False)
+
+    def _read_img_txn(self, txn, root, rel_path, is_lmdb=True):
+            """高效的底层读取，不主动开关事务"""
+            if is_lmdb:
+                buf = txn.get(rel_path.encode('ascii'))
+                if buf is None: raise ValueError(f"LMDB Key not found: {rel_path}")
+                img_np = np.frombuffer(buf, dtype=np.uint8)
+                img = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+            else:
+                img = cv2.imread(os.path.join(root, rel_path), cv2.IMREAD_COLOR)
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
     def _read_img(self, env, root, rel_path):
         """统一读取图片接口"""
