@@ -1,68 +1,99 @@
 #!/bin/bash
 
 # =================================================================
-# 本地单卡 Debug/训练脚本
-# 用法: ./local_train.sh config/mvdeinter/<your_yaml>.yaml [checkpoint_path]
+# Local single-GPU debug/training script
+# Usage: ./local_train.sh config/mvdeinter/<your_yaml>.yaml [checkpoint_path]
 # =================================================================
 
 CONFIG_FILE=$1
 RESUME_CKPT=$2
 
-# 1. 参数校验
+# 1️⃣ 参数校验
 if [ -z "$CONFIG_FILE" ]; then
     echo "Error: No config file specified!"
     echo "Usage: ./local_train.sh config/mvdeinter/<your_yaml>.yaml"
     exit 1
 fi
 
-# 2. 路径处理
-# 获取脚本所在目录的绝对路径，确保在任何地方运行都能找到根目录
-PROJECT_ROOT=$(cd "$(dirname "$0")"; pwd)
-cd "$PROJECT_ROOT"
+# 2️⃣ 项目根目录 (根据脚本位置)
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+PROJECT_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 
-# 定义你的本地数据存放路径 (请修改为你本地 LMDB 文件夹的实际位置)
-# 获取 PROJECT_ROOT 上一级的 data/REDS_data 目录的绝对路径
-LOCAL_DATA_DIR=$(realpath "$PROJECT_ROOT/../data/REDS_data")
+# 绝对路径
+CONFIG_FILE_ABS="$PROJECT_ROOT/$CONFIG_FILE"
+TRAIN_SCRIPT="$PROJECT_ROOT/train.py"
 
+# 检查 train.py 是否存在
+if [ ! -f "$TRAIN_SCRIPT" ]; then
+    echo "Error: train.py not found at $TRAIN_SCRIPT"
+    exit 1
+fi
+
+# 检查配置文件是否存在
+if [ ! -f "$CONFIG_FILE_ABS" ]; then
+    echo "Error: Config file not found at $CONFIG_FILE_ABS"
+    exit 1
+fi
+
+# 3️⃣ 本地数据路径 (请修改为你实际的 REDS LMDB 目录)
+LOCAL_DATA_DIR=/home/mcrlab/Documents/REDS_lmdb
+if [ ! -d "$LOCAL_DATA_DIR" ]; then
+    echo "Error: Local data directory not found at $LOCAL_DATA_DIR"
+    exit 1
+fi
+
+# 4️⃣ 处理 checkpoint 参数
 if [ -n "$RESUME_CKPT" ]; then
     RESUME_ARGS="--resume $(realpath "$RESUME_CKPT")"
 else
     RESUME_ARGS=""
 fi
 
-CONFIG_FILE_ABS=$(realpath "$CONFIG_FILE")
+# 5️⃣ 激活虚拟环境
+VENV_PATH="$PROJECT_ROOT/.ven/bin/activate"
+if [ ! -f "$VENV_PATH" ]; then
+    echo "Error: Virtual environment not found at $VENV_PATH"
+    exit 1
+fi
+source "$VENV_PATH"
 
-# 3. 环境准备 (本地不需要 module load)
-# 如果你使用 conda，请取消下面这行的注释并修改环境名
-# source activate your_env_name
-# 或者使用 venv
-source .venv/bin/activate 
-
-# 4. 环境变量设置
+# 6️⃣ 环境变量
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export OMP_NUM_THREADS=4 
+export OMP_NUM_THREADS=4
 export MASTER_PORT=$((10000 + RANDOM % 10000))
 
-# 5. 动态重定向配置 (核心：将配置文件中的路径指向本地数据)
-# 原脚本通过 sed 替换 data/REDS_link。
-# 本地最简单的做法是：确保 LOCAL_DATA_DIR 路径下有 REDS_data_GT.lmdb 等文件
+# 7️⃣ 临时配置文件，利用 YAML 深度合并机制覆盖数据路径
 CONFIG_DIR=$(dirname "$CONFIG_FILE_ABS")
 CONFIG_BASENAME=$(basename "$CONFIG_FILE_ABS")
 TMP_CONFIG_ABS="${CONFIG_DIR}/.tmp_local_${CONFIG_BASENAME}"
 
-# 将配置文件里的数据路径占位符替换为本地实际绝对路径
-sed "s|root_dir: '.*'|root_dir: '$LOCAL_DATA_DIR'|g" "$CONFIG_FILE_ABS" > "$TMP_CONFIG_ABS"
+# 先复制主配置文件的内容
+cp "$CONFIG_FILE_ABS" "$TMP_CONFIG_ABS"
+
+# 在临时文件末尾追加本地数据集路径，利用 load_config 的合并机制覆盖 base 配置
+cat <<EOF >> "$TMP_CONFIG_ABS"
+
+dataset:
+  train:
+    root_dir: '$LOCAL_DATA_DIR'
+
+  val:
+    root_dir: '$LOCAL_DATA_DIR'
+
+train:
+    log_freq: 1
+
+EOF
 
 echo "Starting local training with config: $TMP_CONFIG_ABS"
 
-# 6. 启动训练 (单机单卡)
-# 虽然是单卡，建议保留 torchrun，因为 train.py 中包含了 DDP 初始化逻辑 [cite: 18, 41]
+# 8️⃣ 启动训练
 torchrun --nproc_per_node=1 \
     --master_port=$MASTER_PORT \
-    train.py \
+    "$TRAIN_SCRIPT" \
     -c "$TMP_CONFIG_ABS" \
     $RESUME_ARGS
 
-# 7. 清理
+# 9️⃣ 清理
 rm -f "$TMP_CONFIG_ABS"
 echo "Local session finished."
