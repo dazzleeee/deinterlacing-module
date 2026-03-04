@@ -1,8 +1,7 @@
 tools/data_process/verification_mv/
 data/
-out
-err
-*.log
+*.out
+*.err
 work_dirs
 __pycache__
 work_dirs
