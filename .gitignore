@@ -5,3 +5,9 @@ err
 *.log
 work_dirs
 __pycache__
+work_dirs
+*.log
+*.pyc
+__pycache__/
+project_code.txt
+

@@ -4,11 +4,11 @@ dataset:
     root_dir: 'data/REDS_link'
     split: 'train'
     seq_len: 15
-    crop_lr: 32
+    crop_lr: 128
     augment: true
     use_lmdb: true
-    batch_size: 2
-    num_workers: 4
+    batch_size: 10
+    num_workers: 12
   val:
     type: 'RedsDeintDataset'
     root_dir: 'data/REDS_link'

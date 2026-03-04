@@ -109,17 +109,21 @@ class TrainRunner:
                 
                 with autocast():
                     outputs = self.model(imgs, mv_fwd, field_ids)
-                    
+                    # 2. 退出 autocast！强制把关键的 outputs 转换回极其安全的 float32
+                    outputs_fp32 = {k: v.float() if isinstance(v, torch.Tensor) else v for k, v in outputs.items()}
+                    targets_fp32 = {'hr': hr_targets.float()}
+
+                    # 3. 在 float32 精度下算 Loss（尤其是里面的 torch.exp 就绝对不会爆了）
+                    loss_dict = self.loss_aggregator(outputs_fp32, targets_fp32, epoch)
                    
                     
-                    targets = {'hr': hr_targets}
-                    loss_dict = self.loss_aggregator(outputs, targets, epoch)
+                   
                     total_loss = loss_dict['total_loss']
                 
                 # 反向传播
                 self.scaler.scale(total_loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 
                 scale_before = self.scaler.get_scale()
                 self.scaler.step(self.optimizer)

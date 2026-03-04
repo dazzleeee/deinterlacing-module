@@ -4,6 +4,7 @@ from ..registry import COMPONENT_REGISTRY
 # 必须导入你定义的助手函数
 from .activation import build_activation 
 from motionVectorDeinterlacing.utils.ops import default_init_weights
+import torch.nn.functional as F
 
 # ==========================================
 # 选项 A: 标准残差块 (StandardResidualBlock)

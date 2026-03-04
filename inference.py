@@ -6,6 +6,8 @@ import os
 from motionVectorDeinterlacing.models.registry import ARCH_REGISTRY
 from config.config_schema import MVDNetConfig
 import yaml
+import time
+import csv  # <-- 新增：用于写入 CSV 表格
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Real-time Broadcast Streaming Inference')
@@ -14,6 +16,8 @@ def parse_args():
     parser.add_argument('-i', '--input_video', type=str, required=True, help='Input stream (video file)')
     parser.add_argument('-o', '--output_video', type=str, default='output.mp4', help='Output stream')
     parser.add_argument('-m', '--mv_dir', type=str, required=True, help='Directory containing MV .npz files')
+    # <-- 新增：允许你自定义 csv 文件的保存路径，默认保存在当前目录下
+    parser.add_argument('--csv_log', type=str, default='fps_log.csv', help='Path to save FPS data') 
     return parser.parse_args()
 
 def main():
@@ -45,79 +49,121 @@ def main():
 
     sliding_window = [] # 容量固定为 3 的滑动窗口
     frame_idx = 0
-    print("Broadcast streaming started. Awaiting signal...")
+    
+    # <-- 新增：用于统计总耗时，计算最终的平均 FPS
+    total_process_time = 0.0 
+    processed_frames = 0     
+    
+    print(f"Broadcast streaming started. Awaiting signal...")
+    print(f"FPS logging will be saved to: {args.csv_log}")
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-            
-        # 1. 接收到新帧，处理数据
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        field_id = frame_idx % 2 
-        mv_path = os.path.join(args.mv_dir, f"{frame_idx:08d}_mv_fwd.npz")
-        
-        mv_fwd = np.zeros((2, height, width), dtype=np.float32)
-        if os.path.exists(mv_path):
-            f_arr = np.load(mv_path)["flow_fwd"].astype(np.float32)
-            if f_arr.ndim == 3 and f_arr.shape[2] == 2: 
-                f_arr = np.transpose(f_arr, (2, 0, 1))
-            mv_fwd = f_arr
-        
-        t_img = torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
-        t_mv = torch.from_numpy(mv_fwd).float()
-        
-        # 2. 推入滑动窗口
-        sliding_window.append({
-            'img': t_img, 'mv': t_mv, 'fid': field_id
-        })
-        
-        # 3. 窗口满了3帧，触发单步流式推理
-        if len(sliding_window) == 3:
-            b_imgs = torch.stack([x['img'] for x in sliding_window]).unsqueeze(0).to(device)
-            b_mvs = torch.stack([x['mv'] for x in sliding_window]).unsqueeze(0).to(device)
-            b_fids = torch.tensor([x['fid'] for x in sliding_window]).unsqueeze(0).to(device)
-            
-            with torch.no_grad():
-                sr_out = model.forward_stream_step(b_imgs, b_mvs, b_fids)
+    # <-- 新增：打开 CSV 文件并准备写入
+    with open(args.csv_log, mode='w', newline='') as csv_file:
+        csv_writer = csv.writer(csv_file)
+        # 写入表头
+        csv_writer.writerow(['Frame_Index', 'Process_Time_ms', 'Instant_FPS'])
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
                 
-            # 处理并写出第 t 帧的输出
-            out_frame = sr_out[0].permute(1, 2, 0).cpu().numpy()
-            out_frame = np.clip(out_frame * 255.0, 0, 255).astype(np.uint8)
-            out_writer.write(cv2.cvtColor(out_frame, cv2.COLOR_RGB2BGR))
+            # 1. 接收到新帧，处理数据
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            field_id = frame_idx % 2 
+            mv_path = os.path.join(args.mv_dir, f"{frame_idx:08d}_mv_fwd.npz")
             
-            # 弹出队首老帧
-            sliding_window.pop(0)
+            mv_fwd = np.zeros((2, height, width), dtype=np.float32)
+            if os.path.exists(mv_path):
+                f_arr = np.load(mv_path)["flow_fwd"].astype(np.float32)
+                if f_arr.ndim == 3 and f_arr.shape[2] == 2: 
+                    f_arr = np.transpose(f_arr, (2, 0, 1))
+                mv_fwd = f_arr
             
-        frame_idx += 1
-
-    # 4. 视频流断开（或者结束）时，处理最后两帧（Flush Pipeline）
-    if len(sliding_window) > 0:
-        print("Flushing the remaining frames in the pipeline...")
-        last_item = sliding_window[-1]
-        
-        # 填充两次 dummy 帧将最后两帧顶出来
-        for _ in range(2):
+            t_img = torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
+            t_mv = torch.from_numpy(mv_fwd).float()
+            
+            # 2. 推入滑动窗口
             sliding_window.append({
-                'img': last_item['img'], 
-                'mv': torch.zeros_like(last_item['mv']), 
-                'fid': 1 - sliding_window[-1]['fid']
+                'img': t_img, 'mv': t_mv, 'fid': field_id
             })
             
-            b_imgs = torch.stack([x['img'] for x in sliding_window]).unsqueeze(0).to(device)
-            b_mvs = torch.stack([x['mv'] for x in sliding_window]).unsqueeze(0).to(device)
-            b_fids = torch.tensor([x['fid'] for x in sliding_window]).unsqueeze(0).to(device)
+            # 3. 窗口满了3帧，触发单步流式推理
+            if len(sliding_window) == 3:
+                b_imgs = torch.stack([x['img'] for x in sliding_window]).unsqueeze(0).to(device)
+                b_mvs = torch.stack([x['mv'] for x in sliding_window]).unsqueeze(0).to(device)
+                b_fids = torch.tensor([x['fid'] for x in sliding_window]).unsqueeze(0).to(device)
+                
+                # 测出来的时间才是真正准确的 GPU 推理时间
+                if device.type == 'cuda':
+                    torch.cuda.synchronize() 
+                start_time = time.perf_counter()
+
+                with torch.no_grad():
+                    sr_out = model.forward_stream_step(b_imgs, b_mvs, b_fids)
+
+                if device.type == 'cuda':
+                    torch.cuda.synchronize() 
+                end_time = time.perf_counter()
+                
+                # <-- 新增：计算并记录时间
+                process_time = end_time - start_time
+                current_fps = 1.0 / process_time
+                
+                # 累加用于最后计算平均值 (通常抛弃第一帧的耗时，因为 GPU 刚启动时会有暖机延迟，这里为了严谨，我们从第2次推理开始统计均值)
+                if processed_frames > 0: 
+                    total_process_time += process_time
+                processed_frames += 1
+
+                print(f"Frame {frame_idx} | 耗时: {process_time*1000:.1f} ms | FPS: {current_fps:.2f}")
+                
+                # 写入这一帧的数据到 CSV (保留两位小数)
+                csv_writer.writerow([frame_idx, round(process_time*1000, 2), round(current_fps, 2)])
+                    
+                # 处理并写出第 t 帧的输出
+                out_frame = sr_out[0].permute(1, 2, 0).cpu().numpy()
+                out_frame = np.clip(out_frame * 255.0, 0, 255).astype(np.uint8)
+                out_writer.write(cv2.cvtColor(out_frame, cv2.COLOR_RGB2BGR))
+                
+                # 弹出队首老帧
+                sliding_window.pop(0)
+                
+            frame_idx += 1
+
+        # 4. 视频流断开（或者结束）时，处理最后两帧（Flush Pipeline）
+        if len(sliding_window) > 0:
+            print("Flushing the remaining frames in the pipeline...")
+            last_item = sliding_window[-1]
             
-            with torch.no_grad():
-                sr_out = model.forward_stream_step(b_imgs, b_mvs, b_fids)
-            
-            out_frame = sr_out[0].permute(1, 2, 0).cpu().numpy()
-            out_writer.write(cv2.cvtColor(np.clip(out_frame * 255.0, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
-            sliding_window.pop(0)
+            for _ in range(2):
+                sliding_window.append({
+                    'img': last_item['img'], 
+                    'mv': torch.zeros_like(last_item['mv']), 
+                    'fid': 1 - sliding_window[-1]['fid']
+                })
+                
+                b_imgs = torch.stack([x['img'] for x in sliding_window]).unsqueeze(0).to(device)
+                b_mvs = torch.stack([x['mv'] for x in sliding_window]).unsqueeze(0).to(device)
+                b_fids = torch.tensor([x['fid'] for x in sliding_window]).unsqueeze(0).to(device)
+                
+                with torch.no_grad():
+                    sr_out = model.forward_stream_step(b_imgs, b_mvs, b_fids)
+                
+                out_frame = sr_out[0].permute(1, 2, 0).cpu().numpy()
+                out_writer.write(cv2.cvtColor(np.clip(out_frame * 255.0, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+                sliding_window.pop(0)
+
+        # <-- 新增：在代码末尾打印整体平均 FPS
+        if processed_frames > 1 and total_process_time > 0:
+            avg_fps = (processed_frames - 1) / total_process_time
+            print("\n" + "="*50)
+            print(f"🎉 推理完成! 共处理 {processed_frames} 帧。")
+            print(f"📈 整体平均 FPS: {avg_fps:.2f}")
+            print(f"💾 详细数据已保存至: {args.csv_log}")
+            print("="*50 + "\n")
 
     cap.release()
     out_writer.release()
-    print("Broadcast streaming sequence completed successfully!")
 
 if __name__ == '__main__':
     main()
