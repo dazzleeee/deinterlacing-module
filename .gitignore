@@ -1,12 +1,21 @@
+# data folders
 tools/data_process/verification_mv/
 data/
+
+# logs
+results/
+logs/
+log/
+*.log
 *.out
 *.err
-work_dirs
-__pycache__
-work_dirs
-*.log
-*.pyc
-__pycache__/
-project_code.txt
 
+# training outputs
+work_dirs/
+
+# python cache
+__pycache__/
+*.pyc
+
+# generated files
+project_code.txt
