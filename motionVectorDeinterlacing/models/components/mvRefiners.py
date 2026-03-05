@@ -12,9 +12,9 @@ class VanillaMVRefiner(nn.Module):
         super().__init__()
         # 工业化打包，极简的 ReLU 激活
         self.body = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, 3, 1, 1),
+            nn.Conv2d(in_channels, mid_channels, 7, 1, 3),
             build_activation(act_cfg), 
-            nn.Conv2d(mid_channels, 2, 3, 1, 1)
+            nn.Conv2d(mid_channels, 2, 5, 1, 2)
         )
         
         # 零初始化
@@ -32,9 +32,9 @@ class BasicMVRefiner(nn.Module):
         super().__init__()
         # 工业化改造：打包成 body
         self.body = nn.Sequential(
-            nn.Conv2d(in_channels + feat_channels, mid_channels, 3, 1, 1),
+            nn.Conv2d(in_channels + feat_channels, mid_channels, 7, 1, 3),
             build_activation(act_cfg),
-            nn.Conv2d(mid_channels, 2, 3, 1, 1)
+            nn.Conv2d(mid_channels, 2, 5, 1, 2)
         )
 
         nn.init.zeros_(self.body[-1].weight)
@@ -149,8 +149,7 @@ class LiteImageGuidedMVRefiner(nn.Module):
         self.up_factor = up_factor
  
         
-        # 使用步长卷积进行下采样，相比 Pooling 更有学习能力
-        self.downsample_mv = nn.Conv2d(2, 2, kernel_size=up_factor, stride=up_factor, padding=0)
+        
         
         self.fusion = nn.Conv2d(2 + mid * 2, mid, 3, 1, 1)
         self.body = nn.Sequential(
@@ -168,7 +167,8 @@ class LiteImageGuidedMVRefiner(nn.Module):
         lr_ref_feat = F.avg_pool2d(ref_feat, self.up_factor)
 
         # 1. 步长卷积下采样 MV
-        lr_mv = self.downsample_mv(raw_mv)
+        # 将原始 MV 缩小 self.up_factor 倍（比如 4 倍）
+        lr_mv = F.avg_pool2d(raw_mv, kernel_size=self.up_factor, stride=self.up_factor)
         
         # 2. 低分辨率对齐与误差计算 (全部使用 lr_ 级别的张量)
         warped_ref_feat = mv_warp(lr_ref_feat, lr_mv)
@@ -194,7 +194,7 @@ class LiteConvexMVRefiner(nn.Module):
       
         
         # 1. 步长卷积下采样 MV (代替 pooling)
-        self.downsample_mv = nn.Conv2d(2, 2, kernel_size=up_factor, stride=up_factor)
+        
         
         # 2. 轻量级特征与误差融合 (1/4 分辨率下运行)
         self.fusion = nn.Conv2d(2 + mid * 2, mid, 3, 1, 1)
@@ -226,7 +226,8 @@ class LiteConvexMVRefiner(nn.Module):
         lr_ref_feat = F.avg_pool2d(ref_feat, self.up_factor)
 
         # --- 第一阶段：低分辨率极速计算 (耗时极低) ---
-        lr_mv = self.downsample_mv(raw_mv)
+        # 将原始 MV 缩小 self.up_factor 倍（比如 4 倍）
+        lr_mv = F.avg_pool2d(raw_mv, kernel_size=self.up_factor, stride=self.up_factor)
         
         # Warp & 计算误差图
         warped_ref_feat = mv_warp(lr_ref_feat, lr_mv)

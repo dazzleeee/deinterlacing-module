@@ -4,33 +4,31 @@ _base_:
   - '../_base_/losses/mvdnet_loss.yaml'
 
 model:
-  mid: 64
-  num_blocks: 15
+  mid: 32
+  num_blocks: 10
   lookahead: 2
   propagation_order: 1
   scale: 2
   feat_act_cfg: "LeakyReLU"
-  body_act_cfg: "PReLU"
+  body_act_cfg: "LeakyReLU"
   
   feature_extractor_cfg: 
-    type: 'ResidualFeatureExtractor'
+    type: 'SimpleFeatureExtractor'
     in_channels: 4
-    num_blocks: 5
-    nf: 64
+    nf: 32
   mv_refiner_cfg: 
-    type: 'LiteConvexMVRefiner' # ！！最强光流凸上采样精调！！
+    type: 'LiteConvexMVRefiner' 
   gmc_cfg: 
-    type: 'GMC' # ！！开启 RANSAC 背景剥离补偿！！
+    type: 'FastGPUGMC' # 💡 升级点 2：引入纯 GPU 仿射矩阵预测，剥离背景
   residual_block_cfg: 
-    type: 'ChannelAttentionBlock' # ！！带有 RepConv 和 注意力的最强 Block！！
-    deploy: false # 训练时必须为 false
+    type: 'StandardResidualBlock' 
     
   foward_backward_fusion_cfg: 
     type: 'BasicConcatFusion'
   h_prop_current_feat_fusion_cfg: 
-    type: 'MotionAdaptiveFusion' # 升级版动静融合
+    type: 'SoftGateAdaptiveFusion'
   first_2nd_order_fusion_cfg: 
-    type: 'DeinterlacingMultiOrderFusion'
+    type: 'SimpleAverageFusion' 
   deint_up_cfg: 
     type: 'DeintShufflePack'
     scale_factor: 2

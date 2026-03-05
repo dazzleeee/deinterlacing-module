@@ -15,6 +15,7 @@ from motionVectorDeinterlacing.utils.utils_flow import (
 )
 from config.config_schema import MVDNetConfig 
 from motionVectorDeinterlacing.models import backbones, components    
+from motionVectorDeinterlacing.models.components.fusion import MemoryEfficientTemporalFusion
 
 
 @ARCH_REGISTRY.register('RealTimeMVDnet')
@@ -61,8 +62,9 @@ class RealTimeMVDnet(nn.Module):
         # ✅ 新增：用于兼容 Dense Connection 的 1x1 降维卷积
         # ==========================================================
         self.bwd_channel_reduce = nn.Conv2d(self.mid * 2, self.mid, kernel_size=1, stride=1)
-        self.fwd_channel_reduce = nn.Conv2d(self.mid * 3, self.mid, kernel_size=1, stride=1)
-        # ==========================================================
+        # 删掉 self.fwd_channel_reduce，换成下面这个：
+       
+        self.memory_efficient_fusion = MemoryEfficientTemporalFusion(mid_channels=self.mid)
 
         self.refinement = nn.Sequential(
             nn.Conv2d(self.mid, self.mid, 3, 1, 1),
@@ -94,6 +96,7 @@ class RealTimeMVDnet(nn.Module):
     def reset_state(self):
         self.h_fwd_cache = None
         self.stream_cache = None
+        
 
     def _refine_mv_with_gmc(self, raw_pixel_mv, feat_target, feat_ref):
         B, C, H, W = feat_target.shape
@@ -103,10 +106,14 @@ class RealTimeMVDnet(nn.Module):
         refiner_name = self.mv_refiner.__class__.__name__
         interp_mode = 'nearest' if 'Convex' in refiner_name else 'bilinear'
         
-        obj_motion, global_flow = self.gmc(
-            raw_mv_small, H, W, interpolation_mode=interp_mode
-        )
+     
         
+# ======== 唯一需要修改的地方：把特征传给 gmc ========
+        obj_motion, global_flow = self.gmc(
+            raw_mv_small, H, W, interpolation_mode=interp_mode,
+            feat_curr=feat_target, feat_ref=feat_ref  # <--- 加了这一行！
+        )
+
         if refiner_name in ['VanillaMVRefiner']:
             refined_obj_motion = self.mv_refiner(obj_motion)
         elif refiner_name in ['BasicMVRefiner', 'GatedMVRefiner', 'ConvexUpsamplingRefiner']:
@@ -196,8 +203,7 @@ class RealTimeMVDnet(nn.Module):
         else:
             h_fwd = feat_t
 
-        bidirect_feat = torch.cat([h_fwd, bwd_feature_t, feat_t], dim=1)
-        bidirect_feat = self.fwd_channel_reduce(bidirect_feat)
+        bidirect_feat = self.memory_efficient_fusion(h_fwd, bwd_feature_t, feat_t) # 始终维持在 64 维
         h_fwd = self.forward_resblocks(bidirect_feat)
 
         # ==========================================
@@ -305,9 +311,8 @@ class RealTimeMVDnet(nn.Module):
                 else:
                     h_fwd = feats[:, t]
 
-                bidirect_feat = torch.cat([h_fwd, bwd_features[t], feats[:, t]], dim=1)
-                # ✅ 降维：192 -> 64
-                bidirect_feat = self.fwd_channel_reduce(bidirect_feat)
+                # ✅ 修复：使用无峰值的 Memory Efficient Fusion，训练和推理逻辑彻底对齐
+                bidirect_feat = self.memory_efficient_fusion(h_fwd, bwd_features[t], feats[:, t])
                 h_fwd = self.forward_resblocks(bidirect_feat)
                 fwd_features[t] = h_fwd
 
@@ -418,9 +423,9 @@ class RealTimeMVDnet(nn.Module):
                     else:
                         h_fwd = feats[:, t]
 
-                    bidirect_feat = torch.cat([h_fwd, bwd_features[t], feats[:, t]], dim=1)
-                    # ✅ 降维：192 -> 64
-                    bidirect_feat = self.fwd_channel_reduce(bidirect_feat)
+                   
+                    # ✅ 修复：验证模式下也统一使用显存优化融合
+                    bidirect_feat = self.memory_efficient_fusion(h_fwd, bwd_features[t], feats[:, t])
                     h_fwd = self.forward_resblocks(bidirect_feat)
                     fwd_features[t] = h_fwd
 

@@ -4,32 +4,31 @@ _base_:
   - '../_base_/losses/mvdnet_loss.yaml'
 
 model:
-  mid: 64
-  num_blocks: 15
+  mid: 32
+  num_blocks: 10
   lookahead: 2
   propagation_order: 1
   scale: 2
   feat_act_cfg: "LeakyReLU"
-  body_act_cfg: "PReLU"
+  body_act_cfg: "LeakyReLU"
   
   feature_extractor_cfg: 
-    type: 'ResidualFeatureExtractor'
+    type: 'SimpleFeatureExtractor'
     in_channels: 4
-    num_blocks: 5
-    nf: 64
+    nf: 32
   mv_refiner_cfg: 
-    type: 'LiteConvexMVRefiner' 
+    type: 'LiteConvexMVRefiner' # 💡 升级点 1：引入光流凸上采样微调
   gmc_cfg: 
-    type: 'GMC' 
+    type: 'IdentityGMC' 
   residual_block_cfg: 
-    type: 'StandardResidualBlock' # ！！降级为普通残差块！！
+    type: 'StandardResidualBlock' 
     
   foward_backward_fusion_cfg: 
     type: 'BasicConcatFusion'
   h_prop_current_feat_fusion_cfg: 
-    type: 'MotionAdaptiveFusion'
+    type: 'SoftGateAdaptiveFusion'
   first_2nd_order_fusion_cfg: 
-    type: 'DeinterlacingMultiOrderFusion'
+    type: 'SimpleAverageFusion' 
   deint_up_cfg: 
     type: 'DeintShufflePack'
     scale_factor: 2

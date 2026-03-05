@@ -193,3 +193,75 @@ class IdentityGMC(nn.Module):
         global_flow = torch.zeros_like(dense_total_mv)
         
         return dense_total_mv, global_flow
+
+class GPUAffinePredictor(nn.Module):
+    """纯 GPU 的极速轻量级全局运动（仿射矩阵）预测器"""
+    def __init__(self, in_channels=128): # 改变：吃 64+64 通道的特征
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=3, stride=2, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.AdaptiveAvgPool2d(1) 
+        )
+        self.fc = nn.Linear(64, 6)
+        nn.init.zeros_(self.fc.weight)
+        self.fc.bias.data.copy_(torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
+
+    def forward(self, feat_curr, feat_ref):
+        B = feat_curr.size(0)
+        x = torch.cat([feat_curr, feat_ref], dim=1) 
+        feat = self.net(x).view(B, -1)
+        theta = self.fc(feat).view(B, 2, 3)
+        return theta
+
+@COMPONENT_REGISTRY.register('FastGPUGMC')
+class FastGPUGMC(nn.Module):
+    """
+    无缝替代原来 OpenCV RANSAC GMC 的纯 GPU 版本。
+    完美继承原有接口，直接预测矩阵并转换为密集全局光流。
+    """
+    def __init__(self, in_channels=128):
+        super().__init__()
+        self.affine_predictor = GPUAffinePredictor(in_channels=in_channels)
+
+    def get_global_flow_map(self, affine_matrix, H, W, device):
+        B = affine_matrix.size(0)
+        # 1. 生成网格
+        y, x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+        grid = torch.stack([x, y, torch.ones_like(x)], dim=-1).float() # [H, W, 3]
+        grid = grid.unsqueeze(0).expand(B, -1, -1, -1) # 扩展到 Batch Size: [B, H, W, 3]
+        
+        # 2. 矩阵乘法进行全局对齐计算: [B, H, W, 3] @ [B, 3, 2] -> [B, H, W, 2]
+        new_grid = torch.matmul(grid, affine_matrix.transpose(1, 2))
+        
+        # 3. 计算全局光流差值
+        global_flow = new_grid - grid[..., :2]
+        return global_flow.permute(0, 3, 1, 2) # [B, 2, H, W]
+
+    def forward(self, raw_mv_blocks, H, W, interpolation_mode='bilinear', feat_curr=None, feat_ref=None):
+        B = raw_mv_blocks.size(0)
+        device = raw_mv_blocks.device
+        
+        # 1. 极速预测全局仿射矩阵
+        theta = self.affine_predictor(feat_curr, feat_ref)
+        
+        # 2. 转换为全分辨率全局光流 (代替了原来的 RANSAC)
+        global_flow = self.get_global_flow_map(theta, H, W, device)
+        
+        # 3. 剥离局部运动 (和老代码逻辑完美一致，适配凸上采样)
+        if interpolation_mode == 'bilinear':
+            dense_total_mv = F.interpolate(raw_mv_blocks, size=(H, W), mode='bilinear', align_corners=False)
+            object_motion = dense_total_mv - global_flow
+        elif interpolation_mode == 'nearest':
+            _, _, h_small, w_small = raw_mv_blocks.shape
+            global_flow_lr = F.interpolate(global_flow, size=(h_small, w_small), mode='area')
+            object_motion_lr = raw_mv_blocks - global_flow_lr
+            object_motion = F.interpolate(object_motion_lr, size=(H, W), mode='nearest')
+            
+        return object_motion, global_flow

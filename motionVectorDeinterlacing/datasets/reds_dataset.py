@@ -205,7 +205,29 @@ class RedsDeintDataset(Dataset):
                 gt = gt[:, :, ::-1, :].copy()
                 mv_fwd = mv_fwd[:, :, :, ::-1].copy()
                 mv_fwd[:, 0, :, :] *= -1.0 
-
+            # ==========================================
+            # --- 2. 新增：抗过拟合的“退化增强” (Degradation) ---
+            # ==========================================
+            if self.augment:
+                # A. 模拟传感器高斯噪声 (30% 概率触发)
+                # 破坏模型对完美干净图像的依赖
+                if random.random() < 0.3:
+                    # 随机生成标准差为 1~5 的轻微高斯噪声
+                    sigma = random.uniform(1, 5) 
+                    noise = np.random.normal(0, sigma, lr.shape).astype(np.float32)
+                    lr = np.clip(lr.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+                
+                # B. 模拟 H.264/MPEG 视频压缩伪影 (50% 概率触发)
+                # 产生马赛克块和蚊子噪声，教会模型忽略它们
+                if random.random() < 0.5:
+                    # 随机选择 JPEG 压缩质量 (30最烂，85较好)
+                    quality = random.randint(30, 85) 
+                    for i in range(len(lr)):
+                        # 将每一帧编码为低质量 JPEG 再解码回来
+                        success, encimg = cv2.imencode('.jpg', lr[i], [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+                        if success:
+                            lr[i] = cv2.imdecode(encimg, 1)
+            # ==========================================
         imgs_t = torch.stack([to_tensor01(im) for im in lr], dim=0)  
         gts_t  = torch.stack([to_tensor01(im) for im in gt], dim=0)  
         mv_fwd_t = torch.from_numpy(np.ascontiguousarray(mv_fwd)).float()

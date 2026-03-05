@@ -38,6 +38,7 @@ def main():
         if hasattr(module, 'switch_to_deploy'):
             module.switch_to_deploy()
     model.reset_state() # 初始化缓存
+    torch.backends.cudnn.benchmark = True
 
     cap = cv2.VideoCapture(args.input_video)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -100,7 +101,8 @@ def main():
                 start_time = time.perf_counter()
 
                 with torch.no_grad():
-                    sr_out = model.forward_stream_step(b_imgs, b_mvs, b_fids)
+                    with torch.cuda.amp.autocast():
+                        sr_out = model.forward_stream_step(b_imgs, b_mvs, b_fids)
 
                 if device.type == 'cuda':
                     torch.cuda.synchronize() 

@@ -96,10 +96,11 @@ class DeinterlacingMultiOrderFusion(nn.Module):
         super().__init__()
         # 接收三个特征：curr_feat(标准答案), h1_warped(一阶草稿), h2_warped(二阶草稿)
         self.attention_net = nn.Sequential(
-            nn.Conv2d(mid_channels * 3, mid_channels, 3, 1, 1),
+            # 【优化】：将 3x3 卷积 (padding=1) 替换为 1x1 卷积 (padding=0)
+            nn.Conv2d(mid_channels * 3, mid_channels, kernel_size=1, stride=1, padding=0),
             nn.LeakyReLU(0.1, True),
-            # 输出 3 个权重通道！
-            nn.Conv2d(mid_channels, 3, 3, 1, 1) 
+            # 【优化】：第二层同样替换为 1x1 卷积
+            nn.Conv2d(mid_channels, 3, kernel_size=1, stride=1, padding=0) 
         )
     
     def _init_special_weights(self):
@@ -143,5 +144,34 @@ class SimpleAverageFusion(nn.Module):
         w1 = torch.full((B, 1, H, W), 0.5, device=h1_warped.device)
         w2 = torch.full((B, 1, H, W), 0.5, device=h1_warped.device)
         return h_prop, w1, w2
+    
+#融合前向后向以及当前特征
+@COMPONENT_REGISTRY.register('MemoryEfficientTemporalFusion')
+class MemoryEfficientTemporalFusion(nn.Module):
+    def __init__(self, mid_channels=64):
+        super().__init__()
+        # 核心思想：先降维，再拼接 (Pre-reduction)
+        # 将三个 64 通道的特征分别压缩，总和刚好等于 64，避免显存爆炸
+        self.compress_fwd = nn.Conv2d(mid_channels, 21, kernel_size=1)
+        self.compress_bwd = nn.Conv2d(mid_channels, 21, kernel_size=1)
+        self.compress_cur = nn.Conv2d(mid_channels, 22, kernel_size=1)
+        
+        # 可选：加一层 3x3 卷积混合特征，提升标清视频的抗噪能力
+        self.mix_conv = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.PReLU()
+        )
+
+    def forward(self, h_fwd, h_bwd, feat_t):
+        # 1. 独立降维 (这里的中间变量只有原来的 1/3 大小)
+        c_fwd = self.compress_fwd(h_fwd)
+        c_bwd = self.compress_bwd(h_bwd)
+        c_cur = self.compress_cur(feat_t)
+        
+        # 2. 拼接 (此时拼接出来的结果直接就是 64 通道，而不是灾难性的 192 通道)
+        fused = torch.cat([c_fwd, c_bwd, c_cur], dim=1)
+        
+        # 3. 混合平滑
+        return self.mix_conv(fused)
 
 

@@ -22,12 +22,6 @@ def quarterPixelMV_to_pixelMV(raw_mv):
 def rescale_mv_temporal(mv, src_oe=None, tgt_oe=None, scale=0.5, correct_offset=True):
     mv = mv * scale
     
-    # ✅ 加入判断：只有传了极性且要求修正，才执行物理偏移
-    if correct_offset and src_oe is not None and tgt_oe is not None:
-        mask = (src_oe != tgt_oe).view(-1, 1, 1, 1).float()
-        offset = torch.where(tgt_oe.view(-1, 1, 1, 1) == 1, 0.5, -0.5)
-        mv_corrected = mv.clone()
-        mv_corrected[:, 1:2, :, :] += (mask * offset)
-        return mv_corrected
+    
         
     return mv
