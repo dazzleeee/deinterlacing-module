@@ -26,8 +26,19 @@ class RealTimeMVDnet(nn.Module):
         self.lookahead = cfg.lookahead 
         self.prop_order = cfg.propagation_order
         self.feat_extract = build_from_cfg(cfg.feature_extractor_cfg, COMPONENT_REGISTRY)
-        self.mv_refiner = build_from_cfg(cfg.mv_refiner_cfg, COMPONENT_REGISTRY)
-        self.gmc = build_from_cfg(cfg.gmc_cfg, COMPONENT_REGISTRY) 
+        
+        def inject_dim(cfg_dict):
+            d = dict(cfg_dict)
+            t = d['type']
+            if 'GMC' in t: d['in_channels'] = self.mid * 2
+            elif 'MultiOrder' in t: d['mid_channels'] = self.mid
+            elif 'SoftGate' in t or 'Lite' in t or 'ImageGuided' in t: d['mid'] = self.mid
+            elif 'MotionAdaptive' in t or 'BasicConcat' in t: d['c_in'] = self.mid
+            return d
+
+        # 接下来，所有带有隐式维度的组件，都必须套上 inject_dim()
+        self.mv_refiner = build_from_cfg(inject_dim(cfg.mv_refiner_cfg), COMPONENT_REGISTRY)
+        self.gmc = build_from_cfg(inject_dim(cfg.gmc_cfg), COMPONENT_REGISTRY) 
 
         res_cfg = dict(cfg.residual_block_cfg)
         if 'nf' not in res_cfg:
@@ -47,16 +58,12 @@ class RealTimeMVDnet(nn.Module):
         self.forward_resblocks = nn.Sequential(*forward_blocks)
         
         # 融合与重建
-        self.foward_backward_fusion = build_from_cfg(
-            cfg.foward_backward_fusion_cfg, COMPONENT_REGISTRY,
-        ) 
-        
-        self.h_prop_current_feat_fusion = build_from_cfg(
-            cfg.h_prop_current_feat_fusion_cfg, COMPONENT_REGISTRY,
-        )  
-        self.first_2nd_order_fusion = build_from_cfg(
-            cfg.first_2nd_order_fusion_cfg, COMPONENT_REGISTRY,
-        ) 
+        self.foward_backward_fusion = build_from_cfg(inject_dim(cfg.foward_backward_fusion_cfg), COMPONENT_REGISTRY) 
+        self.h_prop_current_feat_fusion = build_from_cfg(inject_dim(cfg.h_prop_current_feat_fusion_cfg), COMPONENT_REGISTRY)  
+        self.first_2nd_order_fusion = build_from_cfg(inject_dim(cfg.first_2nd_order_fusion_cfg), COMPONENT_REGISTRY) 
+        # ==========================================================
+       
+       
         
         # ==========================================================
         # ✅ 新增：用于兼容 Dense Connection 的 1x1 降维卷积

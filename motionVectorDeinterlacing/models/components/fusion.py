@@ -145,33 +145,31 @@ class SimpleAverageFusion(nn.Module):
         w2 = torch.full((B, 1, H, W), 0.5, device=h1_warped.device)
         return h_prop, w1, w2
     
-#融合前向后向以及当前特征
 @COMPONENT_REGISTRY.register('MemoryEfficientTemporalFusion')
 class MemoryEfficientTemporalFusion(nn.Module):
     def __init__(self, mid_channels=64):
         super().__init__()
-        # 核心思想：先降维，再拼接 (Pre-reduction)
-        # 将三个 64 通道的特征分别压缩，总和刚好等于 64，避免显存爆炸
-        self.compress_fwd = nn.Conv2d(mid_channels, 21, kernel_size=1)
-        self.compress_bwd = nn.Conv2d(mid_channels, 21, kernel_size=1)
-        self.compress_cur = nn.Conv2d(mid_channels, 22, kernel_size=1)
+        # 动态划分通道，确保加起来永远严格等于 mid_channels
+        c1 = mid_channels // 3
+        c2 = mid_channels // 3
+        c3 = mid_channels - c1 - c2 # 剩余的补给第三个
         
-        # 可选：加一层 3x3 卷积混合特征，提升标清视频的抗噪能力
+        self.compress_fwd = nn.Conv2d(mid_channels, c1, kernel_size=1)
+        self.compress_bwd = nn.Conv2d(mid_channels, c2, kernel_size=1)
+        self.compress_cur = nn.Conv2d(mid_channels, c3, kernel_size=1)
+        
+        # 保证 mix_conv 接收和输出的都是当前的 mid_channels
         self.mix_conv = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.PReLU()
+            nn.Conv2d(mid_channels, mid_channels, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.1, inplace=True) # 统一使用无参数的 LeakyReLU
         )
 
     def forward(self, h_fwd, h_bwd, feat_t):
-        # 1. 独立降维 (这里的中间变量只有原来的 1/3 大小)
         c_fwd = self.compress_fwd(h_fwd)
         c_bwd = self.compress_bwd(h_bwd)
         c_cur = self.compress_cur(feat_t)
         
-        # 2. 拼接 (此时拼接出来的结果直接就是 64 通道，而不是灾难性的 192 通道)
         fused = torch.cat([c_fwd, c_bwd, c_cur], dim=1)
-        
-        # 3. 混合平滑
         return self.mix_conv(fused)
 
 
