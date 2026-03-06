@@ -1,0 +1,45 @@
+_base_:
+  - '../_base_/datasets/reds_deint.yaml'
+  - '../_base_/schedules/schedule_adamw_cos.yaml'
+  - '../_base_/losses/mvdnet_loss.yaml'
+
+model:
+  # ==================================
+  # 严格控制变量：所有变体统一容量
+  # ==================================
+  mid: 32
+  num_blocks: 10
+  lookahead: 2
+  propagation_order: 1
+  scale: 2
+  feat_act_cfg: "LeakyReLU"
+  body_act_cfg: "LeakyReLU"
+  
+  # ==================================
+  # V1 Baseline: 全部使用最低级组件
+  # ==================================
+  feature_extractor_cfg: 
+    type: 'SimpleFeatureExtractor' # 基础特征提取
+    in_channels: 4
+    nf: 32
+  mv_refiner_cfg: 
+    type: 'VanillaMVRefiner' # 无任何引导的基础光流残差
+  gmc_cfg: 
+    type: 'IdentityGMC' # 关闭全局运动剥离
+  residual_block_cfg: 
+    type: 'StandardResidualBlock' # 无注意力机制的基础残差块
+    
+  foward_backward_fusion_cfg: 
+    type: 'BasicConcatFusion'
+  h_prop_current_feat_fusion_cfg: 
+    type: 'SoftGateAdaptiveFusion' # 基础动静融合
+  first_2nd_order_fusion_cfg: 
+    type: 'SimpleAverageFusion' # 基础无脑均值融合
+  deint_up_cfg: 
+    type: 'DeintShufflePack'
+    scale_factor: 2
+dataset:
+  train:
+    root_dir: '/localscratch/sihanuo.57400166.0/REDS_data'
+  val:
+    root_dir: '/localscratch/sihanuo.57400166.0/REDS_data'

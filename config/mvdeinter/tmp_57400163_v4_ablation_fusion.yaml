@@ -1,0 +1,39 @@
+_base_:
+  - '../_base_/datasets/reds_deint.yaml'
+  - '../_base_/schedules/schedule_adamw_cos.yaml'
+  - '../_base_/losses/mvdnet_loss.yaml'
+
+model:
+  mid: 32
+  num_blocks: 10
+  lookahead: 2
+  propagation_order: 1
+  scale: 2
+  feat_act_cfg: "LeakyReLU"
+  body_act_cfg: "LeakyReLU"
+  
+  feature_extractor_cfg: 
+    type: 'SimpleFeatureExtractor'
+    in_channels: 4
+    nf: 32
+  mv_refiner_cfg: 
+    type: 'LiteConvexMVRefiner'
+  gmc_cfg: 
+    type: 'FastGPUGMC'
+  residual_block_cfg: 
+    type: 'StandardResidualBlock' 
+    
+  foward_backward_fusion_cfg: 
+    type: 'BasicConcatFusion'
+  h_prop_current_feat_fusion_cfg: 
+    type: 'MotionAdaptiveFusion' # 💡 升级点 3：引入高级带权重的动静自适应融合
+  first_2nd_order_fusion_cfg: 
+    type: 'DeinterlacingMultiOrderFusion' # 💡 升级点 4：一二阶带止损机制的融合
+  deint_up_cfg: 
+    type: 'DeintShufflePack'
+    scale_factor: 2
+dataset:
+  train:
+    root_dir: '/localscratch/sihanuo.57400163.0/REDS_data'
+  val:
+    root_dir: '/localscratch/sihanuo.57400163.0/REDS_data'
