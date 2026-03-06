@@ -4,9 +4,9 @@
 #SBATCH --error=scripts/logs/train_err_%j.err
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1
-#SBATCH --gpus=h100:2            
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=128000M
+#SBATCH --gpus=a100:1            
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64000M
 
 # =================================================================
 # 🚀 1. 自动定位并进入代码根目录 (SLURM 终极解法)
@@ -48,7 +48,7 @@ fi
 # =================================================================
 # 🚀 3. 定位原始数据目录 (Nibi 上的路径)
 # =================================================================
-ORIGINAL_DATA_DIR="/home/sihanuo/projects/def-jyzhao/SihanZhang/REDSdata"
+ORIGINAL_DATA_DIR="/home/sihanuo/projects/def-jyzhao/sihanuo/REDS_lmdb"
 if [ ! -d "$ORIGINAL_DATA_DIR" ]; then
     echo "Error: Original data directory not found at $ORIGINAL_DATA_DIR"
     exit 1
@@ -62,13 +62,13 @@ mkdir -p scripts/logs
 module purge
 module load StdEnv/2023 python/3.11 opencv/4.9.0
 # Nibi 上的虚拟环境路径
-source /home/sihanuo/projects/def-jyzhao/SihanZhang/deinterlacing/.venv/bin/activate
+source /home/sihanuo/projects/def-jyzhao/sihanuo/deinterlacing-module/.ven/bin/activate
 
 # 强制 Python 无缓冲输出，用于实时用 tail -f 查看 train_log_xxx.out
 export PYTHONUNBUFFERED=1
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export OMP_NUM_THREADS=12
+export OMP_NUM_THREADS=8
 export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
 
 # ================= 🚨 拯救双卡卡死的 NCCL 魔法 =================
@@ -109,7 +109,7 @@ echo "Starting training with unique config: $TMP_CONFIG_ABS"
 # =================================================================
 # 🚀 7. 启动 DDP 训练 (注意这里修好了漏掉的斜杠)
 # =================================================================
-torchrun --nproc_per_node=2 \
+torchrun --nproc_per_node=1 \
     --master_port=$MASTER_PORT \
     train.py \
     -c "$TMP_CONFIG_ABS" \

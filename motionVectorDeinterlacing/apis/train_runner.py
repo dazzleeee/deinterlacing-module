@@ -32,7 +32,7 @@ class TrainRunner:
         
         self.model = ARCH_REGISTRY.get('RealTimeMVDnet')(cfg.model).to(self.device)
         if self.world_size > 1:
-            self.model = DDP(self.model, device_ids=[self.rank], output_device=self.rank, find_unused_parameters=True)
+            self.model = DDP(self.model, device_ids=[self.rank], output_device=self.rank, find_unused_parameters=False)
             
         # ✅ 3. 初始化 EMA 影子模型 (衰减率通常取 0.999 或 0.9999)
         self.ema = ModelEMA(self.model, decay=0.999)

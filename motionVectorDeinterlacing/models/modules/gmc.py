@@ -232,16 +232,25 @@ class FastGPUGMC(nn.Module):
 
     def get_global_flow_map(self, affine_matrix, H, W, device):
         B = affine_matrix.size(0)
-        # 1. 生成网格
+        # 1. 生成基础网格
         y, x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
         grid = torch.stack([x, y, torch.ones_like(x)], dim=-1).float() # [H, W, 3]
-        grid = grid.unsqueeze(0).expand(B, -1, -1, -1) # 扩展到 Batch Size: [B, H, W, 3]
         
-        # 2. 矩阵乘法进行全局对齐计算: [B, H, W, 3] @ [B, 3, 2] -> [B, H, W, 2]
-        new_grid = torch.matmul(grid, affine_matrix.transpose(1, 2))
+        # ================== 🚀 核心修复部分 ==================
+        # 2. 将空间维度 H 和 W 拉平，方便与仿射矩阵进行 Batch 矩阵乘法
+        # grid 原本是 [H, W, 3]，拉平为 [H*W, 3]，再扩展到 Batch 维度变成 [B, H*W, 3]
+        grid_flat = grid.view(-1, 3).unsqueeze(0).expand(B, -1, -1)
         
-        # 3. 计算全局光流差值
-        global_flow = new_grid - grid[..., :2]
+        # 3. 矩阵乘法: [B, H*W, 3] @ [B, 3, 2] -> [B, H*W, 2]
+        new_grid_flat = torch.matmul(grid_flat, affine_matrix.transpose(1, 2))
+        
+        # 4. 算完之后，把展平的维度重新变回图像的 H 和 W
+        new_grid = new_grid_flat.view(B, H, W, 2)
+        grid_expanded = grid.unsqueeze(0).expand(B, -1, -1, -1) # 原始 grid 也扩展到 batch 用于相减
+        # =====================================================
+        
+        # 5. 计算全局光流差值
+        global_flow = new_grid - grid_expanded[..., :2]
         return global_flow.permute(0, 3, 1, 2) # [B, 2, H, W]
 
     def forward(self, raw_mv_blocks, H, W, interpolation_mode='bilinear', feat_curr=None, feat_ref=None):

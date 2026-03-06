@@ -19,3 +19,5 @@ __pycache__/
 
 # generated files
 project_code.txt
+
+*.sh

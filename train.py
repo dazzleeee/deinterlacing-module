@@ -66,6 +66,13 @@ def main():
 
     # 1. 唤醒 DDP
     init_dist(args.local_rank)
+
+    # 1. 开启 A100/H100 专属的 TF32 矩阵乘法加速
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+# 2. 开启 cuDNN 的底层算法自动寻优 (因为你的视频输入尺寸 H, W 是固定的)
+    torch.backends.cudnn.benchmark = True
     
     # --- 实验目录与配置备份初始化 (只在主进程执行) ---
     exp_name = os.path.splitext(os.path.basename(args.config))[0]
