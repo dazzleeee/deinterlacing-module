@@ -13,10 +13,6 @@ config/_base_/.DS_Store
 config/_base_/datasets/reds_deint.yaml
 config/_base_/losses/mvdnet_loss.yaml
 config/_base_/schedules/schedule_adamw_cos.yaml
-config/mvdeinter/v1_vanilla_fast_baseline.yaml
-config/mvdeinter/v2_sota_attention_convex.yaml
-config/mvdeinter/v3_ablation_no_gmc.yaml
-config/mvdeinter/v4_ablation_no_attention.yaml
 motionVectorDeinterlacing/.DS_Store
 motionVectorDeinterlacing/__init__.py
 motionVectorDeinterlacing.egg-info/PKG-INFO

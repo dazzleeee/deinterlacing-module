@@ -176,12 +176,14 @@ class GlobalMotionCompensator(nn.Module):
         
         return object_motion, global_flow
     
+
 @COMPONENT_REGISTRY.register('IdentityGMC')
 class IdentityGMC(nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
 
-    def forward(self, raw_mv_blocks, H, W, interpolation_mode='bilinear'):
+    # ✅ Added feat_curr, feat_ref, and **kwargs here
+    def forward(self, raw_mv_blocks, H, W, interpolation_mode='bilinear', feat_curr=None, feat_ref=None, **kwargs):
         # 1. 直接把原始稀疏 MV 放大到全分辨率
         # 即使不做背景补偿，也要支持不同的插值方式（bilinear 或 nearest）
         # 这样才能配合不同的 Refiner (比如 ConvexUpsamplingRefiner)
